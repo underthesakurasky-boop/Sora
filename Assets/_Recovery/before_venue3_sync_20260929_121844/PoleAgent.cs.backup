@@ -1,0 +1,397 @@
+using UnityEngine;
+
+public class PoleAgent : MonoBehaviour
+{
+    public string AgentName;
+    public TeamId Team;
+    public AgentRole Role;
+    public AgentAction CurrentAction;
+    public string AbilityNote = "normal";
+    public float MoveSpeed = 2.8f;
+    public float PushForceNewtons = 72f;
+    public float StabilizeForceNewtons = 42f;
+    public float GuardRadius = 5f;
+    public float PersonalSpace = 1.15f;
+    public float AttackReach = 2.25f;
+    public float DefenseReach = 2.05f;
+
+    private PoleBattleGameManager gameManager;
+    private BattlePole ownPole;
+    private BattlePole enemyPole;
+    private Vector3 spawnPoint;
+    private Vector3 currentTarget;
+    private float nextRetargetTime;
+    private Renderer cachedRenderer;
+    private TextMesh label;
+    private GameObject leaderMarker;
+    private Renderer leaderMarkerRenderer;
+    private Color baseColor;
+    private bool isLeader;
+
+    public void Initialize(
+        PoleBattleGameManager manager,
+        string agentName,
+        TeamId team,
+        BattlePole own,
+        BattlePole enemy,
+        Color bodyColor)
+    {
+        gameManager = manager;
+        AgentName = agentName;
+        Team = team;
+        ownPole = own;
+        enemyPole = enemy;
+        spawnPoint = transform.position;
+        Role = AgentRole.Attacker;
+        CurrentAction = AgentAction.MoveToEnemyPole;
+        cachedRenderer = GetComponent<Renderer>();
+        baseColor = bodyColor;
+
+        if (cachedRenderer != null)
+        {
+            cachedRenderer.material.color = GetRoleColor();
+        }
+
+        CreateNameLabel();
+        CreateLeaderMarker();
+        UpdateNameLabel();
+    }
+
+    private void Update()
+    {
+        UpdateLabelFacingCamera();
+
+        if (gameManager == null || gameManager.BattleFinished || !gameManager.BattleStarted)
+        {
+            return;
+        }
+
+        if (gameManager.IsTeamEliminated(Team))
+        {
+            MoveToward(spawnPoint);
+            return;
+        }
+
+        if (Time.time >= nextRetargetTime)
+        {
+            currentTarget = ChooseTarget();
+            nextRetargetTime = Time.time + Random.Range(0.25f, 0.75f);
+        }
+
+        MoveToward(currentTarget);
+        ApplyPolePressureIfClose();
+    }
+
+    public void ApplyDecision(AgentDecision decision)
+    {
+        Role = decision.Role;
+        CurrentAction = decision.Action;
+        currentTarget = ChooseTarget();
+        UpdateBodyColor();
+        UpdateNameLabel();
+    }
+
+    public void SetLeaderVisual(bool leader)
+    {
+        isLeader = leader;
+        UpdateBodyColor();
+        UpdateNameLabel();
+    }
+
+    public void SetAbilityProfile(string abilityNote, float forceMultiplier, float speedMultiplier)
+    {
+        AbilityNote = abilityNote;
+        PushForceNewtons *= forceMultiplier;
+        StabilizeForceNewtons *= forceMultiplier;
+        MoveSpeed *= speedMultiplier;
+    }
+
+    public string GetShortState()
+    {
+        return AgentName + "," + Team + "," + Role + "," + CurrentAction + ",ability=" + AbilityNote + "," + transform.position.ToString("F1");
+    }
+
+    private void CreateNameLabel()
+    {
+        GameObject labelObject = new GameObject("Agent Label");
+        labelObject.transform.SetParent(transform, false);
+        labelObject.transform.localPosition = new Vector3(0f, 1.55f, 0f);
+
+        label = labelObject.AddComponent<TextMesh>();
+        label.anchor = TextAnchor.MiddleCenter;
+        label.alignment = TextAlignment.Center;
+        label.characterSize = 0.24f;
+        label.fontSize = 48;
+        label.color = Color.white;
+        labelObject.SetActive(false);
+    }
+
+    private void UpdateNameLabel()
+    {
+        if (label == null)
+        {
+            return;
+        }
+
+        label.gameObject.SetActive(isLeader);
+        label.text = Team.ToString().ToUpperInvariant() + " LEADER\n" + AgentName;
+        label.color = GetTeamLabelColor(Team);
+    }
+
+    private void UpdateBodyColor()
+    {
+        if (cachedRenderer == null)
+        {
+            return;
+        }
+
+        cachedRenderer.material.color = GetRoleColor();
+        if (leaderMarker != null)
+        {
+            leaderMarker.SetActive(isLeader);
+        }
+    }
+
+    private void CreateLeaderMarker()
+    {
+        leaderMarker = GameObject.CreatePrimitive(PrimitiveType.Sphere);
+        leaderMarker.name = "Leader Marker";
+        leaderMarker.transform.SetParent(transform, false);
+        leaderMarker.transform.localPosition = new Vector3(0f, 1.95f, 0f);
+        leaderMarker.transform.localScale = new Vector3(0.35f, 0.35f, 0.35f);
+
+        Collider markerCollider = leaderMarker.GetComponent<Collider>();
+        if (markerCollider != null)
+        {
+            Object.Destroy(markerCollider);
+        }
+
+        leaderMarkerRenderer = leaderMarker.GetComponent<Renderer>();
+        if (leaderMarkerRenderer != null)
+        {
+            leaderMarkerRenderer.material.color = Color.white;
+        }
+
+        leaderMarker.SetActive(false);
+    }
+
+    private Color GetRoleColor()
+    {
+        switch (Role)
+        {
+            case AgentRole.Defender:
+                return Color.Lerp(baseColor, Color.black, 0.45f);
+            case AgentRole.Supporter:
+                return Color.Lerp(baseColor, Color.white, 0.45f);
+            default:
+                return baseColor;
+        }
+    }
+
+    private void UpdateLabelFacingCamera()
+    {
+        if (label == null || Camera.main == null)
+        {
+            return;
+        }
+
+        label.transform.rotation = Quaternion.LookRotation(label.transform.position - Camera.main.transform.position);
+    }
+
+    private Vector3 ChooseTarget()
+    {
+        RefreshActivePoleTargets();
+        if (enemyPole == null || ownPole == null)
+        {
+            return spawnPoint;
+        }
+
+        switch (CurrentAction)
+        {
+            case AgentAction.MoveToEnemyPole:
+                if (!gameManager.CanAgentPushPole(this, enemyPole))
+                {
+                    return TacticalPointAroundPole(enemyPole, 4.5f, GetAttackSideSign());
+                }
+                return TacticalPointAroundPole(enemyPole, 1.35f, GetAttackSideSign());
+            case AgentAction.GuardOwnPole:
+                return TacticalPointAroundPole(ownPole, 1.55f, GetDefenseSideSign());
+            case AgentAction.SupportNearestAttacker:
+                if (!gameManager.CanAgentPushPole(this, enemyPole))
+                {
+                    return TacticalPointAroundPole(enemyPole, 4.8f, GetAttackSideSign());
+                }
+                PoleAgent attacker = gameManager.FindNearestAllyWithRole(this, AgentRole.Attacker);
+                return attacker != null ? OffsetAround(attacker.transform.position, 1.15f) : TacticalPointAroundPole(enemyPole, 2.1f, GetAttackSideSign());
+            case AgentAction.ChaseEnemy:
+                PoleAgent enemy = gameManager.FindNearestEnemy(this);
+                return enemy != null ? enemy.transform.position : OffsetAround(ownPole.transform.position, GuardRadius);
+            case AgentAction.Celebrate:
+                return spawnPoint;
+            default:
+                return transform.position;
+        }
+    }
+
+    private void MoveToward(Vector3 target)
+    {
+        Vector3 flatTarget = new Vector3(target.x, transform.position.y, target.z);
+        Vector3 delta = flatTarget - transform.position;
+        delta.y = 0f;
+
+        if (delta.magnitude < 0.08f)
+        {
+            return;
+        }
+
+        Vector3 direction = delta.normalized;
+        Vector3 avoidance = gameManager.ComputeSeparation(this, PersonalSpace);
+        Vector3 finalDirection = (direction + avoidance * 2.4f).normalized;
+        Vector3 nextPosition = transform.position + finalDirection * MoveSpeed * Time.deltaTime;
+
+        if (!gameManager.IsPositionClear(this, nextPosition, PersonalSpace * 0.82f))
+        {
+            if (avoidance.sqrMagnitude < 0.001f)
+            {
+                return;
+            }
+
+            finalDirection = avoidance.normalized;
+            nextPosition = transform.position + finalDirection * MoveSpeed * 0.65f * Time.deltaTime;
+            if (!gameManager.IsPositionClear(this, nextPosition, PersonalSpace * 0.72f))
+            {
+                return;
+            }
+        }
+
+        transform.position = nextPosition;
+        transform.rotation = Quaternion.Slerp(transform.rotation, Quaternion.LookRotation(finalDirection), Time.deltaTime * 10f);
+    }
+
+    private void ApplyPolePressureIfClose()
+    {
+        RefreshActivePoleTargets();
+        if (enemyPole == null || ownPole == null)
+        {
+            return;
+        }
+
+        if (CurrentAction == AgentAction.GuardOwnPole)
+        {
+            ApplyStabilizingPressureIfClose();
+            return;
+        }
+
+        if (CurrentAction != AgentAction.MoveToEnemyPole && CurrentAction != AgentAction.SupportNearestAttacker)
+        {
+            return;
+        }
+
+        if (enemyPole == null || enemyPole.IsDown || !gameManager.CanAgentPushPole(this, enemyPole))
+        {
+            return;
+        }
+
+        Vector3 agentPosition = transform.position;
+        Vector3 polePosition = enemyPole.transform.position;
+        agentPosition.y = 0f;
+        polePosition.y = 0f;
+
+        float distance = Vector3.Distance(agentPosition, polePosition);
+        if (distance <= AttackReach)
+        {
+            enemyPole.ApplyPush(transform.position, PushForceNewtons, Team);
+            gameManager.RecordPressure(this, enemyPole);
+        }
+    }
+
+    private void ApplyStabilizingPressureIfClose()
+    {
+        if (ownPole == null || ownPole.IsDown)
+        {
+            return;
+        }
+
+        Vector3 agentPosition = transform.position;
+        Vector3 polePosition = ownPole.transform.position;
+        agentPosition.y = 0f;
+        polePosition.y = 0f;
+
+        float distance = Vector3.Distance(agentPosition, polePosition);
+        if (distance <= DefenseReach)
+        {
+            ownPole.ApplyStabilizingPush(StabilizeForceNewtons, Team);
+            gameManager.RecordPressure(this, ownPole);
+        }
+    }
+
+    private void RefreshActivePoleTargets()
+    {
+        if (gameManager == null)
+        {
+            return;
+        }
+
+        BattlePole activeOwnPole = gameManager.GetNearestActiveOwnPole(Team, transform.position);
+        BattlePole activeEnemyPole = gameManager.GetAssignedActiveEnemyPole(this);
+        if (activeOwnPole != null)
+        {
+            ownPole = activeOwnPole;
+        }
+
+        if (activeEnemyPole != null)
+        {
+            enemyPole = activeEnemyPole;
+        }
+    }
+
+    private Vector3 TacticalPointAroundPole(BattlePole pole, float radius, float sideSign)
+    {
+        float lane = GetLaneOffset();
+        Vector3 point = pole.transform.position + new Vector3(sideSign * radius, 0f, lane);
+        point.y = transform.position.y;
+        return point;
+    }
+
+    private float GetAttackSideSign()
+    {
+        return transform.position.x <= 0f ? -1f : 1f;
+    }
+
+    private float GetDefenseSideSign()
+    {
+        return -GetAttackSideSign();
+    }
+
+    private float GetLaneOffset()
+    {
+        int hash = Mathf.Abs(AgentName.GetHashCode());
+        int lane = hash % 3;
+        return (lane - 1) * 0.85f;
+    }
+
+    private Vector3 OffsetAround(Vector3 center, float radius)
+    {
+        float teamSign = transform.position.x <= 0f ? -1f : 1f;
+        float angle = (AgentName.GetHashCode() % 360) * Mathf.Deg2Rad + Time.time * 0.15f;
+        Vector3 offset = new Vector3(Mathf.Cos(angle) * radius * teamSign, 0f, Mathf.Sin(angle) * radius);
+        return center + offset;
+    }
+
+    private Color GetTeamLabelColor(TeamId team)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                return new Color(1f, 0.25f, 0.2f);
+            case TeamId.Blue:
+                return new Color(0.25f, 0.55f, 1f);
+            case TeamId.Green:
+                return new Color(0.25f, 1f, 0.45f);
+            case TeamId.Yellow:
+                return new Color(1f, 0.65f, 0.05f);
+            default:
+                return Color.white;
+        }
+    }
+}

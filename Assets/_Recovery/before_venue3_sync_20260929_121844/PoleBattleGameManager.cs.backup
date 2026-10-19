@@ -1,0 +1,2681 @@
+using System.Collections;
+using System.Collections.Generic;
+using System.IO;
+using System.Text;
+using System.Text.RegularExpressions;
+using UnityEngine;
+using UnityEngine.Networking;
+using UnityEngine.SceneManagement;
+
+public class PoleBattleGameManager : MonoBehaviour
+{
+    private const string LeaderDefinition = "Leader = current round plan proposer; the chosen plan is used to assign team roles/actions.";
+    private static int globalMatchNumber = 1;
+
+    public enum LLMProvider
+    {
+        OpenAI,
+        OllamaLocal
+    }
+
+    public BattlePole RedPole;
+    public BattlePole BluePole;
+    public float DiscussionInterval = 45f;
+    public float MaxBattleSeconds = 180f;
+    public bool UseLLMBrain = true;
+    public bool UseIndividualLLMAgents = true;
+    public bool RequireLLMOpeningPlan = true;
+    public string OpenAIModel = "gpt-4.1-mini";
+    public string OpenAIApiKey = "";
+    public string OpenAIKeyFileName = "OpenAIKey.txt";
+    public string RunCountFileName = "RunCount.txt";
+    public LLMProvider Provider = LLMProvider.OpenAI;
+    public string LocalLLMModel = "llama3.2:latest";
+    public string OllamaGenerateUrl = "http://localhost:11434/api/generate";
+    public int MaxLLMOutputTokens = 650;
+    public int LLMRetryCount = 2;
+    public bool UseFallbackOpinionOnLLMFailure = true;
+    public bool AutoRestartBattles = true;
+    public float RestartDelaySeconds = 4f;
+    public float ForceLogInterval = 0.5f;
+    public float LLMRequestTimeoutSeconds = 45f;
+    public float OpeningLLMRetrySeconds = 3f;
+    public int MinimumLLMAgentOpinionsToStart = 6;
+    public float IndividualAgentThinkingDelaySeconds = 0.15f;
+    public int MaxLLMSpeakersPerTeam;
+    public int MaxActivePushersPerPole;
+    public string VenueId = "A";
+    public string VenueName = "Initial 6v6 individual LLM";
+    public bool RequireAllPolesDownToLose;
+    public bool RequireLastPoleStanding;
+    public bool BattleStarted { get; private set; }
+    public bool BattleFinished { get; private set; }
+
+    private readonly List<PoleAgent> redAgents = new List<PoleAgent>();
+    private readonly List<PoleAgent> blueAgents = new List<PoleAgent>();
+    private readonly List<PoleAgent> greenAgents = new List<PoleAgent>();
+    private readonly List<PoleAgent> yellowAgents = new List<PoleAgent>();
+    private readonly List<BattlePole> redPoles = new List<BattlePole>();
+    private readonly List<BattlePole> bluePoles = new List<BattlePole>();
+    private readonly List<BattlePole> greenPoles = new List<BattlePole>();
+    private readonly List<BattlePole> yellowPoles = new List<BattlePole>();
+    private readonly Dictionary<PoleAgent, float> recentPressure = new Dictionary<PoleAgent, float>();
+    private readonly Dictionary<PoleAgent, float> nextPushLogTime = new Dictionary<PoleAgent, float>();
+    private readonly Dictionary<PoleAgent, int> leaderSelectionsThisMatch = new Dictionary<PoleAgent, int>();
+    private readonly Dictionary<PoleAgent, int> attackerAssignmentsThisMatch = new Dictionary<PoleAgent, int>();
+    private readonly Dictionary<PoleAgent, int> defenderAssignmentsThisMatch = new Dictionary<PoleAgent, int>();
+    private readonly Dictionary<PoleAgent, int> supporterAssignmentsThisMatch = new Dictionary<PoleAgent, int>();
+    private readonly Dictionary<PoleAgent, int> pushSamplesThisMatch = new Dictionary<PoleAgent, int>();
+    private readonly Dictionary<PoleAgent, float> estimatedForceSumThisMatch = new Dictionary<PoleAgent, float>();
+    private readonly List<string> conversationRows = new List<string>();
+    private readonly List<string> pushRows = new List<string>();
+    private readonly List<string> forceRows = new List<string>();
+    private readonly List<string> leaderRows = new List<string>();
+    private TeamBrain redBrain;
+    private TeamBrain blueBrain;
+    private TeamBrain greenBrain;
+    private TeamBrain yellowBrain;
+    private ExperimentLogger logger;
+    private float nextDiscussionTime;
+    private float nextForceLogTime;
+    private float finishedBattleDurationSeconds = -1f;
+    private int configuredMatchLimit;
+    private bool redLLMInFlight;
+    private bool blueLLMInFlight;
+    private bool greenLLMInFlight;
+    private bool yellowLLMInFlight;
+    private bool redOpeningPlanReady;
+    private bool blueOpeningPlanReady;
+    private bool greenOpeningPlanReady;
+    private bool yellowOpeningPlanReady;
+    private float battleStartTime;
+    private string winnerText = "";
+    private string llmStatus = "LLM: starting";
+    private LearningSaveData learningData;
+    private string learningSavePath;
+    private int matchNumber;
+    private string currentRedLeader = "";
+    private string currentBlueLeader = "";
+    private string currentGreenLeader = "";
+    private string currentYellowLeader = "";
+
+    private void Awake()
+    {
+        matchNumber = globalMatchNumber;
+        logger = GetComponent<ExperimentLogger>();
+        if (logger == null)
+        {
+            logger = gameObject.AddComponent<ExperimentLogger>();
+        }
+
+        LoadApiKey();
+        LoadRunLimit();
+    }
+
+    public static void ResetMatchCounter()
+    {
+        globalMatchNumber = 1;
+    }
+
+    private void Start()
+    {
+        LoadLearningData();
+        redBrain = new TeamBrain(TeamId.Red, redAgents, this);
+        blueBrain = new TeamBrain(TeamId.Blue, blueAgents, this);
+        greenBrain = new TeamBrain(TeamId.Green, greenAgents, this);
+        yellowBrain = new TeamBrain(TeamId.Yellow, yellowAgents, this);
+        nextDiscussionTime = float.MaxValue;
+        llmStatus = IsLLMReady()
+            ? "LLM: active via " + Provider
+            : GetMissingLLMMessage();
+        StartCoroutine(BeginBattleAfterOpeningDiscussion());
+    }
+
+    private void Update()
+    {
+        if (BattleFinished)
+        {
+            return;
+        }
+
+        if (!BattleStarted)
+        {
+            return;
+        }
+
+        if (Time.time >= nextDiscussionTime)
+        {
+            HoldActiveTeamDiscussions();
+            nextDiscussionTime = Time.time + DiscussionInterval;
+            DecayPressureScores();
+        }
+
+        if (Time.time >= nextForceLogTime)
+        {
+            LogForceSnapshots();
+            nextForceLogTime = Time.time + ForceLogInterval;
+        }
+
+        if (RequireLastPoleStanding)
+        {
+            TeamId? winner = GetLastStandingTeam();
+            if (winner.HasValue)
+            {
+                FinishBattle(winner.Value + " wins: last pole standing.", winner);
+            }
+        }
+        else if (RequireAllPolesDownToLose)
+        {
+            bool redAllDown = AreAllPolesDown(TeamId.Red);
+            bool blueAllDown = AreAllPolesDown(TeamId.Blue);
+            if (redAllDown && blueAllDown)
+            {
+                FinishBattle("Draw: all poles fell.", null);
+            }
+            else if (redAllDown)
+            {
+                FinishBattle("Blue wins: all red poles fell.", TeamId.Blue);
+            }
+            else if (blueAllDown)
+            {
+                FinishBattle("Red wins: all blue poles fell.", TeamId.Red);
+            }
+        }
+        else if (RedPole != null && RedPole.IsDown)
+        {
+            FinishBattle("Blue wins: red pole fell.", TeamId.Blue);
+        }
+        else if (BluePole != null && BluePole.IsDown)
+        {
+            FinishBattle("Red wins: blue pole fell.", TeamId.Red);
+        }
+
+        if (BattleFinished)
+        {
+            return;
+        }
+
+        if (Time.time - battleStartTime >= MaxBattleSeconds)
+        {
+            TeamId? winner = ChooseWinnerByAverageStability();
+            string result = winner.HasValue ? winner.Value + " wins by pole stability." : "Draw: equal pole stability.";
+            FinishBattle(result, winner);
+        }
+    }
+
+    public void RegisterPole(BattlePole pole)
+    {
+        switch (pole.Team)
+        {
+            case TeamId.Red:
+                redPoles.Add(pole);
+                if (RedPole == null)
+                {
+                    RedPole = pole;
+                }
+                break;
+            case TeamId.Blue:
+                bluePoles.Add(pole);
+                if (BluePole == null)
+                {
+                    BluePole = pole;
+                }
+                break;
+            case TeamId.Green:
+                greenPoles.Add(pole);
+                break;
+            case TeamId.Yellow:
+                yellowPoles.Add(pole);
+                break;
+        }
+    }
+
+    public void RegisterAgent(PoleAgent agent)
+    {
+        switch (agent.Team)
+        {
+            case TeamId.Red:
+                redAgents.Add(agent);
+                break;
+            case TeamId.Blue:
+                blueAgents.Add(agent);
+                break;
+            case TeamId.Green:
+                greenAgents.Add(agent);
+                break;
+            case TeamId.Yellow:
+                yellowAgents.Add(agent);
+                break;
+        }
+
+        if (!recentPressure.ContainsKey(agent))
+        {
+            recentPressure.Add(agent, 0f);
+        }
+
+        EnsureAgentSummaryTracking(agent);
+    }
+
+    public BattlePole GetOwnPole(TeamId team)
+    {
+        return GetActivePole(team);
+    }
+
+    public BattlePole GetEnemyPole(TeamId team)
+    {
+        BattlePole ownPole = GetActivePole(team);
+        Vector3 reference = ownPole != null ? ownPole.transform.position : Vector3.zero;
+        return GetNearestActiveEnemyPole(team, reference);
+    }
+
+    public BattlePole GetNearestActiveEnemyPole(TeamId team, Vector3 position)
+    {
+        BattlePole best = null;
+        float bestDistance = float.MaxValue;
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (teams[i] == team || IsTeamEliminated(teams[i]))
+            {
+                continue;
+            }
+
+            BattlePole candidate = GetNearestActivePole(teams[i], position);
+            if (candidate == null)
+            {
+                continue;
+            }
+
+            float distance = Vector3.Distance(position, candidate.transform.position);
+            if (distance < bestDistance)
+            {
+                best = candidate;
+                bestDistance = distance;
+            }
+        }
+
+        return best;
+    }
+
+    public BattlePole GetAssignedActiveEnemyPole(PoleAgent agent)
+    {
+        if (agent == null || MaxActivePushersPerPole <= 0)
+        {
+            return agent == null ? null : GetNearestActiveEnemyPole(agent.Team, agent.transform.position);
+        }
+
+        List<BattlePole> candidates = new List<BattlePole>();
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (teams[i] == agent.Team || IsTeamEliminated(teams[i]))
+            {
+                continue;
+            }
+
+            List<BattlePole> poles = GetPoles(teams[i]);
+            for (int p = 0; p < poles.Count; p++)
+            {
+                if (poles[p] != null && !poles[p].IsDown)
+                {
+                    candidates.Add(poles[p]);
+                }
+            }
+        }
+
+        if (candidates.Count == 0)
+        {
+            return null;
+        }
+
+        int agentIndex = Mathf.Max(0, ExtractAgentNumber(agent.AgentName) - 1);
+        return candidates[agentIndex % candidates.Count];
+    }
+
+    public bool CanAgentPushPole(PoleAgent agent, BattlePole pole)
+    {
+        if (agent == null || pole == null || pole.IsDown || pole.Team == agent.Team || IsTeamEliminated(agent.Team))
+        {
+            return false;
+        }
+
+        if (MaxActivePushersPerPole <= 0)
+        {
+            return true;
+        }
+
+        int requesterNumber = ExtractAgentNumber(agent.AgentName);
+        int eligibleBefore = 0;
+        List<PoleAgent> members = GetMembers(agent.Team);
+        for (int i = 0; i < members.Count; i++)
+        {
+            PoleAgent candidate = members[i];
+            if (candidate == null
+                || (candidate.CurrentAction != AgentAction.MoveToEnemyPole
+                    && candidate.CurrentAction != AgentAction.SupportNearestAttacker)
+                || GetAssignedActiveEnemyPole(candidate) != pole)
+            {
+                continue;
+            }
+
+            if (ExtractAgentNumber(candidate.AgentName) < requesterNumber)
+            {
+                eligibleBefore++;
+            }
+        }
+
+        return eligibleBefore < MaxActivePushersPerPole;
+    }
+
+    public BattlePole GetNearestActiveOwnPole(TeamId team, Vector3 position)
+    {
+        return GetNearestActivePole(team, position);
+    }
+
+    public PoleAgent FindNearestEnemy(PoleAgent requester)
+    {
+        PoleAgent best = null;
+        float bestDistance = float.MaxValue;
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (teams[i] == requester.Team || IsTeamEliminated(teams[i]))
+            {
+                continue;
+            }
+
+            PoleAgent candidate = FindNearest(requester.transform.position, GetMembers(teams[i]), requester);
+            if (candidate == null)
+            {
+                continue;
+            }
+
+            float distance = Vector3.Distance(requester.transform.position, candidate.transform.position);
+            if (distance < bestDistance)
+            {
+                best = candidate;
+                bestDistance = distance;
+            }
+        }
+
+        return best;
+    }
+
+    public PoleAgent FindNearestAllyWithRole(PoleAgent requester, AgentRole role)
+    {
+        List<PoleAgent> allies = GetMembers(requester.Team);
+        PoleAgent best = null;
+        float bestDistance = float.MaxValue;
+
+        for (int i = 0; i < allies.Count; i++)
+        {
+            PoleAgent candidate = allies[i];
+            if (candidate == requester || candidate.Role != role)
+            {
+                continue;
+            }
+
+            float distance = Vector3.Distance(requester.transform.position, candidate.transform.position);
+            if (distance < bestDistance)
+            {
+                best = candidate;
+                bestDistance = distance;
+            }
+        }
+
+        return best;
+    }
+
+    public Vector3 ComputeSeparation(PoleAgent requester, float radius)
+    {
+        Vector3 push = Vector3.zero;
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            AddSeparationFromList(requester, GetMembers(teams[i]), radius, ref push);
+        }
+        return push;
+    }
+
+    public bool IsPositionClear(PoleAgent requester, Vector3 candidatePosition, float minDistance)
+    {
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (!IsPositionClearFromList(requester, candidatePosition, GetMembers(teams[i]), minDistance))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private BattlePole GetActivePole(TeamId team)
+    {
+        List<BattlePole> poles = GetPoles(team);
+        for (int i = 0; i < poles.Count; i++)
+        {
+            if (poles[i] != null && !poles[i].IsDown)
+            {
+                return poles[i];
+            }
+        }
+
+        return poles.Count > 0 ? poles[0] : null;
+    }
+
+    private BattlePole GetNearestActivePole(TeamId team, Vector3 position)
+    {
+        List<BattlePole> poles = GetPoles(team);
+        BattlePole best = null;
+        float bestDistance = float.MaxValue;
+        for (int i = 0; i < poles.Count; i++)
+        {
+            BattlePole pole = poles[i];
+            if (pole == null || pole.IsDown)
+            {
+                continue;
+            }
+
+            float distance = Vector3.Distance(position, pole.transform.position);
+            if (distance < bestDistance)
+            {
+                best = pole;
+                bestDistance = distance;
+            }
+        }
+
+        return best != null ? best : GetActivePole(team);
+    }
+
+    private List<BattlePole> GetPoles(TeamId team)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                return redPoles;
+            case TeamId.Blue:
+                return bluePoles;
+            case TeamId.Green:
+                return greenPoles;
+            case TeamId.Yellow:
+                return yellowPoles;
+            default:
+                return redPoles;
+        }
+    }
+
+    private TeamId[] GetActiveTeams()
+    {
+        if (RequireLastPoleStanding || greenAgents.Count > 0 || yellowAgents.Count > 0 || greenPoles.Count > 0 || yellowPoles.Count > 0)
+        {
+            return new TeamId[] { TeamId.Red, TeamId.Blue, TeamId.Green, TeamId.Yellow };
+        }
+
+        return new TeamId[] { TeamId.Red, TeamId.Blue };
+    }
+
+    public bool IsTeamEliminated(TeamId team)
+    {
+        List<BattlePole> poles = GetPoles(team);
+        return poles.Count > 0 && AreAllPolesDown(team);
+    }
+
+    private TeamId? GetLastStandingTeam()
+    {
+        TeamId? standingTeam = null;
+        int standingCount = 0;
+        TeamId[] teams = GetActiveTeams();
+
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (IsTeamEliminated(teams[i]))
+            {
+                continue;
+            }
+
+            standingTeam = teams[i];
+            standingCount++;
+        }
+
+        return standingCount == 1 ? standingTeam : null;
+    }
+
+    private TeamId? ChooseWinnerByAverageStability()
+    {
+        TeamId? winner = null;
+        float best = -1f;
+        bool tied = false;
+        TeamId[] teams = GetActiveTeams();
+
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (IsTeamEliminated(teams[i]))
+            {
+                continue;
+            }
+
+            float stability = GetTeamAverageStability(teams[i]);
+            if (stability > best + 0.1f)
+            {
+                winner = teams[i];
+                best = stability;
+                tied = false;
+            }
+            else if (Mathf.Abs(stability - best) <= 0.1f)
+            {
+                tied = true;
+            }
+        }
+
+        return tied ? null : winner;
+    }
+
+    private bool AreAllPolesDown(TeamId team)
+    {
+        List<BattlePole> poles = GetPoles(team);
+        if (poles.Count == 0)
+        {
+            return false;
+        }
+
+        for (int i = 0; i < poles.Count; i++)
+        {
+            if (poles[i] != null && !poles[i].IsDown)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private int CountActivePoles(TeamId team)
+    {
+        List<BattlePole> poles = GetPoles(team);
+        int count = 0;
+        for (int i = 0; i < poles.Count; i++)
+        {
+            if (poles[i] != null && !poles[i].IsDown)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private float GetTeamAverageStability(TeamId team)
+    {
+        List<BattlePole> poles = GetPoles(team);
+        if (poles.Count == 0)
+        {
+            return 0f;
+        }
+
+        float total = 0f;
+        int counted = 0;
+        for (int i = 0; i < poles.Count; i++)
+        {
+            if (poles[i] == null)
+            {
+                continue;
+            }
+
+            total += poles[i].Stability;
+            counted++;
+        }
+
+        return counted > 0 ? total / counted : 0f;
+    }
+
+    private string GetTeamPoleSummary(TeamId team)
+    {
+        List<BattlePole> poles = GetPoles(team);
+        return "active " + CountActivePoles(team) + "/" + poles.Count + " avg stability " + GetTeamAverageStability(team).ToString("F0");
+    }
+
+    private TeamId GetPrimaryOpponentTeam(TeamId team, Vector3 position)
+    {
+        TeamId[] teams = GetActiveTeams();
+        TeamId fallback = team == TeamId.Red ? TeamId.Blue : TeamId.Red;
+        float bestDistance = float.MaxValue;
+
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (teams[i] == team || IsTeamEliminated(teams[i]))
+            {
+                continue;
+            }
+
+            BattlePole pole = GetNearestActivePole(teams[i], position);
+            if (pole == null)
+            {
+                continue;
+            }
+
+            float distance = Vector3.Distance(position, pole.transform.position);
+            if (distance < bestDistance)
+            {
+                fallback = teams[i];
+                bestDistance = distance;
+            }
+        }
+
+        return fallback;
+    }
+
+    public int CountEnemiesNearOwnPole(TeamId team)
+    {
+        BattlePole ownPole = GetOwnPole(team);
+        if (ownPole == null)
+        {
+            return 0;
+        }
+
+        int count = 0;
+        TeamId[] teams = GetActiveTeams();
+        for (int t = 0; t < teams.Length; t++)
+        {
+            if (teams[t] == team || IsTeamEliminated(teams[t]))
+            {
+                continue;
+            }
+
+            List<PoleAgent> enemies = GetMembers(teams[t]);
+            for (int i = 0; i < enemies.Count; i++)
+            {
+                if (Vector3.Distance(enemies[i].transform.position, ownPole.transform.position) <= 5f)
+                {
+                    count++;
+                }
+            }
+        }
+
+        return count;
+    }
+
+    public float GetRecentPressureScore(PoleAgent agent)
+    {
+        float value;
+        return recentPressure.TryGetValue(agent, out value) ? value : 0f;
+    }
+
+    public TeamLearningState GetLearningState(TeamId team)
+    {
+        if (learningData == null)
+        {
+            learningData = new LearningSaveData();
+        }
+
+        switch (team)
+        {
+            case TeamId.Red:
+                return learningData.Red;
+            case TeamId.Blue:
+                return learningData.Blue;
+            case TeamId.Green:
+                return learningData.Green;
+            case TeamId.Yellow:
+                return learningData.Yellow;
+            default:
+                return learningData.Red;
+        }
+    }
+
+    public void RecordLeaderChoice(TeamId team, string leaderName, string reason)
+    {
+        MarkCurrentLeader(team, leaderName);
+        PoleAgent leaderAgent = FindAgentByName(team, leaderName);
+        if (leaderAgent != null)
+        {
+            IncrementCounter(leaderSelectionsThisMatch, leaderAgent);
+        }
+
+        if (team == TeamId.Red)
+        {
+            currentRedLeader = leaderName;
+        }
+        else if (team == TeamId.Blue)
+        {
+            currentBlueLeader = leaderName;
+        }
+        else if (team == TeamId.Green)
+        {
+            currentGreenLeader = leaderName;
+        }
+        else if (team == TeamId.Yellow)
+        {
+            currentYellowLeader = leaderName;
+        }
+
+        TeamLearningState learning = GetLearningState(team);
+        learning.RecordLeader(leaderName);
+
+        string message = "leader=" + leaderName + "; definition=current round plan proposer; reason: " + reason;
+        AddLimitedRow(leaderRows, Time.time.ToString("F1") + " [" + team + "] " + message);
+        if (logger != null)
+        {
+            logger.WriteLearningLine("[" + team + "] leader choice: " + message);
+        }
+    }
+
+    public void RecordPressure(PoleAgent agent, BattlePole targetPole)
+    {
+        if (!recentPressure.ContainsKey(agent))
+        {
+            recentPressure.Add(agent, 0f);
+        }
+
+        recentPressure[agent] += Time.deltaTime * 10f;
+        IncrementCounter(pushSamplesThisMatch, agent);
+        AddFloat(estimatedForceSumThisMatch, agent, agent.PushForceNewtons);
+
+        float nextTime;
+        if (!nextPushLogTime.TryGetValue(agent, out nextTime) || Time.time >= nextTime)
+        {
+            string message = "pushed " + targetPole.Team + " pole; force=" + agent.PushForceNewtons.ToString("F0") + "N; torque=" + targetPole.LastTorque.ToString("F0") + "; pushers=" + targetPole.LastPusherCount;
+            LogEvent("push", agent, "", message);
+            AddLimitedRow(pushRows, Time.time.ToString("F1") + " " + agent.AgentName + " -> " + targetPole.Team + " | " + targetPole.GetForceSummary());
+            nextPushLogTime[agent] = Time.time + 0.75f;
+        }
+    }
+
+    private void LogForceSnapshots()
+    {
+        List<BattlePole> poles = GetAllPoles();
+        for (int i = 0; i < poles.Count; i++)
+        {
+            BattlePole pole = poles[i];
+            if (pole == null)
+            {
+                continue;
+            }
+
+            string row = Time.time.ToString("F1") + " " + pole.name + ": " + pole.GetForceSummary();
+            AddLimitedRow(forceRows, row);
+            if (logger != null)
+            {
+                logger.WriteForceSnapshot(VenueId, matchNumber, pole);
+            }
+        }
+    }
+
+    private List<BattlePole> GetAllPoles()
+    {
+        List<BattlePole> poles = new List<BattlePole>();
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            poles.AddRange(GetPoles(teams[i]));
+        }
+
+        return poles;
+    }
+
+    private void EnsureAgentSummaryTracking(PoleAgent agent)
+    {
+        EnsureCounter(leaderSelectionsThisMatch, agent);
+        EnsureCounter(attackerAssignmentsThisMatch, agent);
+        EnsureCounter(defenderAssignmentsThisMatch, agent);
+        EnsureCounter(supporterAssignmentsThisMatch, agent);
+        EnsureCounter(pushSamplesThisMatch, agent);
+        if (!estimatedForceSumThisMatch.ContainsKey(agent))
+        {
+            estimatedForceSumThisMatch.Add(agent, 0f);
+        }
+    }
+
+    private void EnsureCounter(Dictionary<PoleAgent, int> dictionary, PoleAgent agent)
+    {
+        if (agent != null && !dictionary.ContainsKey(agent))
+        {
+            dictionary.Add(agent, 0);
+        }
+    }
+
+    private void IncrementCounter(Dictionary<PoleAgent, int> dictionary, PoleAgent agent)
+    {
+        if (agent == null)
+        {
+            return;
+        }
+
+        EnsureCounter(dictionary, agent);
+        dictionary[agent]++;
+    }
+
+    private void AddFloat(Dictionary<PoleAgent, float> dictionary, PoleAgent agent, float value)
+    {
+        if (agent == null)
+        {
+            return;
+        }
+
+        if (!dictionary.ContainsKey(agent))
+        {
+            dictionary.Add(agent, 0f);
+        }
+
+        dictionary[agent] += value;
+    }
+
+    private int GetCounter(Dictionary<PoleAgent, int> dictionary, PoleAgent agent)
+    {
+        int value;
+        return agent != null && dictionary.TryGetValue(agent, out value) ? value : 0;
+    }
+
+    private float GetFloat(Dictionary<PoleAgent, float> dictionary, PoleAgent agent)
+    {
+        float value;
+        return agent != null && dictionary.TryGetValue(agent, out value) ? value : 0f;
+    }
+
+    private void RecordRoleAssignment(PoleAgent agent, AgentRole role)
+    {
+        EnsureAgentSummaryTracking(agent);
+        switch (role)
+        {
+            case AgentRole.Attacker:
+                IncrementCounter(attackerAssignmentsThisMatch, agent);
+                break;
+            case AgentRole.Defender:
+                IncrementCounter(defenderAssignmentsThisMatch, agent);
+                break;
+            case AgentRole.Supporter:
+                IncrementCounter(supporterAssignmentsThisMatch, agent);
+                break;
+        }
+    }
+
+    public void LogConversation(TeamId team, string speaker, string message)
+    {
+        PoleAgent agent = FindAgentByName(team, speaker);
+        if (agent != null)
+        {
+            LogEvent("conversation", agent, "", message);
+        }
+        else if (logger != null)
+        {
+            logger.WriteEvent("conversation", team, speaker, AgentRole.Supporter, AgentAction.Idle, "", message, GetTeamAverageStability(TeamId.Red), GetTeamAverageStability(TeamId.Blue), Vector3.zero);
+        }
+
+        AddLimitedRow(conversationRows, Time.time.ToString("F1") + " [" + team + "] " + speaker + ": " + message);
+        if (logger != null)
+        {
+            logger.WriteConversationLine("[" + team + "] " + speaker + ": " + message);
+        }
+        Debug.Log("[" + team + "] " + speaker + ": " + message);
+    }
+
+    private void LogDiscussionRound(TeamId team, PoleAgent agent, LLMAgentOpinion opinion, string finalLeader, string result)
+    {
+        if (logger == null || agent == null || opinion == null)
+        {
+            return;
+        }
+
+        logger.WriteDiscussionRound(
+            VenueId,
+            matchNumber,
+            opinion.phase,
+            GetRoundNumber(opinion.phase),
+            team,
+            agent.AgentName,
+            opinion.preferredRole,
+            opinion.preferredAction,
+            opinion.leaderVote,
+            Mathf.Clamp01(opinion.confidence),
+            finalLeader,
+            result,
+            opinion.message);
+    }
+
+    private void LogDiscussionDecision(TeamId team, PoleAgent agent, LLMAgentOpinion opinion, string finalLeader, string result, string message)
+    {
+        if (logger == null || agent == null)
+        {
+            return;
+        }
+
+        string vote = opinion != null ? opinion.leaderVote : "";
+        float confidence = opinion != null ? Mathf.Clamp01(opinion.confidence) : 0f;
+        logger.WriteDiscussionRound(
+            VenueId,
+            matchNumber,
+            string.IsNullOrEmpty(result) ? "final_decision" : "match_result",
+            string.IsNullOrEmpty(result) ? 4 : 5,
+            team,
+            agent.AgentName,
+            agent.Role.ToString(),
+            agent.CurrentAction.ToString(),
+            vote,
+            confidence,
+            finalLeader,
+            result,
+            message);
+    }
+
+    private int GetRoundNumber(string phase)
+    {
+        if (phase == "initial")
+        {
+            return 1;
+        }
+
+        if (phase == "response")
+        {
+            return 2;
+        }
+
+        if (phase == "final")
+        {
+            return 3;
+        }
+
+        return 0;
+    }
+
+    private void LogSystemConversation(string message)
+    {
+        AddLimitedRow(conversationRows, Time.time.ToString("F1") + " [System] " + message);
+        if (logger != null)
+        {
+            logger.WriteConversationLine("[System] " + message);
+        }
+
+        Debug.Log("[System] " + message);
+    }
+
+    public void LogRole(PoleAgent agent, string leader)
+    {
+        LogEvent("role", agent, leader, "role=" + agent.Role + "; action=" + agent.CurrentAction);
+        if (agent.AgentName == leader)
+        {
+            AddLimitedRow(leaderRows, Time.time.ToString("F1") + " [" + agent.Team + "] leader: " + leader);
+        }
+    }
+
+    private void HoldTeamDiscussion(TeamId team)
+    {
+        if (IsTeamEliminated(team))
+        {
+            return;
+        }
+
+        if (!UseLLMBrain || !IsLLMReady())
+        {
+            llmStatus = GetMissingLLMMessage();
+            GetRuleBrain(team).HoldDiscussion();
+            return;
+        }
+
+        if (GetLLMInFlight(team))
+        {
+            llmStatus = "LLM still discussing: " + team;
+            return;
+        }
+
+        StartCoroutine(RequestLLMDiscussion(team, false));
+    }
+
+    private void HoldActiveTeamDiscussions()
+    {
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (!IsTeamEliminated(teams[i]))
+            {
+                HoldTeamDiscussion(teams[i]);
+            }
+        }
+    }
+
+    private void HoldActiveRuleDiscussions()
+    {
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (!IsTeamEliminated(teams[i]))
+            {
+                GetRuleBrain(teams[i]).HoldDiscussion();
+            }
+        }
+    }
+
+    private void StartOpeningLLMDiscussions()
+    {
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            StartCoroutine(RequestLLMDiscussion(teams[i], true));
+        }
+    }
+
+    private bool GetLLMInFlight(TeamId team)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                return redLLMInFlight;
+            case TeamId.Blue:
+                return blueLLMInFlight;
+            case TeamId.Green:
+                return greenLLMInFlight;
+            case TeamId.Yellow:
+                return yellowLLMInFlight;
+            default:
+                return false;
+        }
+    }
+
+    private void SetLLMInFlight(TeamId team, bool value)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                redLLMInFlight = value;
+                break;
+            case TeamId.Blue:
+                blueLLMInFlight = value;
+                break;
+            case TeamId.Green:
+                greenLLMInFlight = value;
+                break;
+            case TeamId.Yellow:
+                yellowLLMInFlight = value;
+                break;
+        }
+    }
+
+    private void ResetOpeningPlanReady()
+    {
+        redOpeningPlanReady = false;
+        blueOpeningPlanReady = false;
+        greenOpeningPlanReady = false;
+        yellowOpeningPlanReady = false;
+    }
+
+    private void SetOpeningPlanReady(TeamId team, bool value)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                redOpeningPlanReady = value;
+                break;
+            case TeamId.Blue:
+                blueOpeningPlanReady = value;
+                break;
+            case TeamId.Green:
+                greenOpeningPlanReady = value;
+                break;
+            case TeamId.Yellow:
+                yellowOpeningPlanReady = value;
+                break;
+        }
+    }
+
+    private bool AnyLLMInFlight()
+    {
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (GetLLMInFlight(teams[i]))
+            {
+                return true;
+            }
+        }
+
+        return false;
+    }
+
+    private bool AreOpeningPlansReady()
+    {
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (!GetOpeningPlanReady(teams[i]))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private bool GetOpeningPlanReady(TeamId team)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                return redOpeningPlanReady;
+            case TeamId.Blue:
+                return blueOpeningPlanReady;
+            case TeamId.Green:
+                return greenOpeningPlanReady;
+            case TeamId.Yellow:
+                return yellowOpeningPlanReady;
+            default:
+                return false;
+        }
+    }
+
+    private IEnumerator BeginBattleAfterOpeningDiscussion()
+    {
+        yield return null;
+
+        BattleStarted = false;
+        LogSystemConversation("Game is paused until opening team discussions finish.");
+
+        while (true)
+        {
+            LoadApiKey();
+            ResetOpeningPlanReady();
+
+            if (!UseLLMBrain || !IsLLMReady())
+            {
+                if (RequireLLMOpeningPlan)
+                {
+                    llmStatus = GetMissingLLMMessage();
+                    yield return new WaitForSeconds(OpeningLLMRetrySeconds);
+                    continue;
+                }
+
+                llmStatus = "Opening plan: rule-based fallback";
+                HoldActiveRuleDiscussions();
+                break;
+            }
+
+            llmStatus = "Opening plan: waiting for LLM";
+            StartOpeningLLMDiscussions();
+
+            while (AnyLLMInFlight())
+            {
+                yield return null;
+            }
+
+            if (!RequireLLMOpeningPlan || AreOpeningPlansReady())
+            {
+                break;
+            }
+
+            llmStatus = "Opening LLM failed; retrying in " + OpeningLLMRetrySeconds.ToString("F0") + " sec";
+            LogSystemConversation("Opening LLM plan failed. Battle remains paused and will retry.");
+            yield return new WaitForSeconds(OpeningLLMRetrySeconds);
+        }
+
+        BattleStarted = true;
+        battleStartTime = Time.time;
+        nextDiscussionTime = Time.time + DiscussionInterval;
+        nextForceLogTime = Time.time + ForceLogInterval;
+        llmStatus = IsLLMReady()
+            ? "LLM: opening plan complete via " + Provider
+            : "LLM: off, rule battle started";
+        LogSystemConversation("Opening discussions complete. Battle started.");
+    }
+
+    private IEnumerator RequestLLMDiscussion(TeamId team, bool openingPlan)
+    {
+        SetLLMInFlight(team, true);
+
+        if (UseIndividualLLMAgents)
+        {
+            yield return StartCoroutine(RequestIndividualAgentDiscussion(team, openingPlan));
+
+            SetLLMInFlight(team, false);
+
+            yield break;
+        }
+
+        llmStatus = "LLM: requesting " + team + " via " + Provider;
+        string prompt = BuildLLMPrompt(team);
+        UnityWebRequest request = CreateLLMRequest(prompt);
+
+        yield return request.SendWebRequest();
+
+        bool appliedPlan = false;
+        if (request.result != UnityWebRequest.Result.Success)
+        {
+            llmStatus = openingPlan && RequireLLMOpeningPlan ? "LLM failed before start: " + request.error : "LLM failed: rule fallback";
+            Debug.LogWarning("LLM request failed: " + request.error + " " + request.downloadHandler.text);
+            if (!openingPlan || !RequireLLMOpeningPlan)
+            {
+                GetRuleBrain(team).HoldDiscussion();
+            }
+        }
+        else
+        {
+            string responseText = ExtractLLMResponseText(request.downloadHandler.text);
+            appliedPlan = ApplyLLMPlan(team, responseText);
+            if (!appliedPlan)
+            {
+                llmStatus = openingPlan && RequireLLMOpeningPlan ? "LLM parse failed before start" : "LLM parse failed: rule fallback";
+                Debug.LogWarning("LLM parse failed. Raw text: " + responseText);
+                if (!openingPlan || !RequireLLMOpeningPlan)
+                {
+                    GetRuleBrain(team).HoldDiscussion();
+                }
+            }
+            else
+            {
+                llmStatus = "LLM: active via " + Provider;
+            }
+        }
+
+        if (openingPlan && appliedPlan)
+        {
+            SetOpeningPlanReady(team, true);
+        }
+
+        SetLLMInFlight(team, false);
+    }
+
+    private IEnumerator RequestIndividualAgentDiscussion(TeamId team, bool openingPlan)
+    {
+        List<PoleAgent> members = GetMembers(team);
+        List<PoleAgent> speakers = GetDiscussionSpeakers(members);
+        List<LLMAgentOpinion> initialOpinions = new List<LLMAgentOpinion>();
+        List<LLMAgentOpinion> responseOpinions = new List<LLMAgentOpinion>();
+        List<LLMAgentOpinion> finalOpinions = new List<LLMAgentOpinion>();
+
+        llmStatus = "Round 1: " + team + " initial opinions";
+        LogSystemConversation("[" + team + "] Round 1: " + speakers.Count + " selected agents give initial opinions.");
+        for (int i = 0; i < speakers.Count; i++)
+        {
+            PoleAgent agent = speakers[i];
+            llmStatus = "Round 1: " + agent.AgentName + " thinking";
+            yield return StartCoroutine(RequestLLMAgentOpinion(team, agent, "initial", initialOpinions, new List<LLMAgentOpinion>()));
+
+            if (IndividualAgentThinkingDelaySeconds > 0f)
+            {
+                yield return new WaitForSeconds(IndividualAgentThinkingDelaySeconds);
+            }
+        }
+
+        llmStatus = "Round 2: " + team + " responses";
+        LogSystemConversation("[" + team + "] Round 2: selected agents react to teammate opinions.");
+        for (int i = 0; i < speakers.Count; i++)
+        {
+            PoleAgent agent = speakers[i];
+            llmStatus = "Round 2: " + agent.AgentName + " responding";
+            yield return StartCoroutine(RequestLLMAgentOpinion(team, agent, "response", responseOpinions, initialOpinions));
+
+            if (IndividualAgentThinkingDelaySeconds > 0f)
+            {
+                yield return new WaitForSeconds(IndividualAgentThinkingDelaySeconds);
+            }
+        }
+
+        List<LLMAgentOpinion> discussionContext = new List<LLMAgentOpinion>();
+        discussionContext.AddRange(initialOpinions);
+        discussionContext.AddRange(responseOpinions);
+
+        llmStatus = "Round 3: " + team + " final vote";
+        LogSystemConversation("[" + team + "] Round 3: selected agents cast final leader votes and role choices.");
+        for (int i = 0; i < speakers.Count; i++)
+        {
+            PoleAgent agent = speakers[i];
+            llmStatus = "Round 3: " + agent.AgentName + " finalizing";
+            yield return StartCoroutine(RequestLLMAgentOpinion(team, agent, "final", finalOpinions, discussionContext));
+
+            if (IndividualAgentThinkingDelaySeconds > 0f)
+            {
+                yield return new WaitForSeconds(IndividualAgentThinkingDelaySeconds);
+            }
+        }
+
+        bool appliedPlan = ApplyIndividualAgentOpinions(team, finalOpinions, openingPlan);
+        if (openingPlan && appliedPlan)
+        {
+            SetOpeningPlanReady(team, true);
+        }
+
+        if (!appliedPlan)
+        {
+            llmStatus = openingPlan && RequireLLMOpeningPlan
+                ? "Individual LLM failed before start"
+                : "Individual LLM failed: rule fallback";
+
+            if (!openingPlan || !RequireLLMOpeningPlan)
+            {
+                GetRuleBrain(team).HoldDiscussion();
+            }
+        }
+        else
+        {
+            llmStatus = "Individual LLM agents: active";
+        }
+    }
+
+    private List<PoleAgent> GetDiscussionSpeakers(List<PoleAgent> members)
+    {
+        if (MaxLLMSpeakersPerTeam <= 0 || MaxLLMSpeakersPerTeam >= members.Count)
+        {
+            return members;
+        }
+
+        int count = Mathf.Min(MaxLLMSpeakersPerTeam, members.Count);
+        int start = ((matchNumber - 1) * count) % members.Count;
+        List<PoleAgent> speakers = new List<PoleAgent>(count);
+        for (int i = 0; i < count; i++)
+        {
+            speakers.Add(members[(start + i) % members.Count]);
+        }
+
+        LogSystemConversation("[" + members[0].Team + "] Scalable council mode: " + count
+            + "/" + members.Count + " rotating agents speak for this match.");
+        return speakers;
+    }
+
+    private IEnumerator RequestLLMAgentOpinion(TeamId team, PoleAgent agent, string phase, List<LLMAgentOpinion> opinions, List<LLMAgentOpinion> visibleOpinions)
+    {
+        string basePrompt = BuildAgentLLMPrompt(team, agent, phase, visibleOpinions);
+        LLMAgentOpinion opinion = null;
+        for (int attempt = 0; attempt <= LLMRetryCount; attempt++)
+        {
+            string prompt = attempt == 0
+                ? basePrompt
+                : basePrompt + " IMPORTANT: Your previous response failed. Return one valid JSON object only. Do not add explanation or markdown.";
+            UnityWebRequest request = CreateLLMRequest(prompt);
+
+            yield return request.SendWebRequest();
+
+            if (request.result != UnityWebRequest.Result.Success)
+            {
+                Debug.LogWarning("Individual LLM request failed for " + agent.AgentName + " attempt " + (attempt + 1) + ": " + request.error + " " + request.downloadHandler.text);
+                LogSystemConversation(agent.AgentName + " LLM request failed; retry " + attempt + "/" + LLMRetryCount + ".");
+                continue;
+            }
+
+            string responseText = ExtractLLMResponseText(request.downloadHandler.text);
+            opinion = ParseAgentOpinion(responseText);
+            if (opinion != null)
+            {
+                break;
+            }
+
+            Debug.LogWarning("Individual LLM parse failed for " + agent.AgentName + " attempt " + (attempt + 1) + ". Raw text: " + responseText);
+            LogSystemConversation(agent.AgentName + " returned unreadable JSON; retry " + attempt + "/" + LLMRetryCount + ".");
+        }
+
+        if (opinion == null)
+        {
+            if (!UseFallbackOpinionOnLLMFailure)
+            {
+                LogSystemConversation(agent.AgentName + " could not speak after retries.");
+                yield break;
+            }
+
+            opinion = CreateFallbackOpinion(team, agent, phase, visibleOpinions);
+            LogSystemConversation(agent.AgentName + " used fallback opinion after LLM failure.");
+        }
+
+        opinion.agent = agent.AgentName;
+        opinion.phase = phase;
+        opinions.Add(opinion);
+        LogDiscussionRound(team, agent, opinion, "", "");
+        LogConversation(team, agent.AgentName, "[" + GetPhaseLabel(phase) + "] " + BuildOpinionLogText(opinion));
+    }
+
+    private string BuildAgentLLMPrompt(TeamId team, PoleAgent agent, string phase, List<LLMAgentOpinion> visibleOpinions)
+    {
+        BattlePole ownPole = GetOwnPole(team);
+        BattlePole enemyPole = GetEnemyPole(team);
+        TeamId opponentTeam = GetPrimaryOpponentTeam(team, agent.transform.position);
+        StringBuilder builder = new StringBuilder();
+        builder.Append("You are an independent LLM agent controlling only ").Append(agent.AgentName).Append(" on team ").Append(team).Append(". ");
+        builder.Append("You are not the whole team. Speak from your own viewpoint and make your own proposal. ");
+        builder.Append(LeaderDefinition).Append(" ");
+        builder.Append(BuildPhaseInstruction(phase));
+        builder.Append("Return only JSON with this exact shape: ");
+        builder.Append("{\"agent\":\"").Append(agent.AgentName).Append("\",\"preferredRole\":\"Attacker\",\"preferredAction\":\"MoveToEnemyPole\",\"leaderVote\":\"").Append(agent.AgentName).Append("\",\"message\":\"I think we should push from the right.\",\"confidence\":0.75}. ");
+        builder.Append("Allowed roles: Attacker, Defender, Supporter. ");
+        builder.Append("Allowed actions: MoveToEnemyPole, GuardOwnPole, SupportNearestAttacker, ChaseEnemy, Idle. ");
+        builder.Append("Your memory: ").Append(GetLearningState(team).GetAgentSummary(agent.AgentName)).Append(". ");
+        builder.Append("Team memory: ").Append(GetLearningState(team).GetSummary()).Append(". ");
+        builder.Append("Current self state: ").Append(agent.GetShortState()).Append(". ");
+        builder.Append("Pole state: own active poles ").Append(CountActivePoles(team)).Append(", own average stability ").Append(GetTeamAverageStability(team).ToString("F0"));
+        builder.Append(", current own target tilt ").Append(ownPole != null ? ownPole.TiltAngleDegrees.ToString("F1") : "-");
+        builder.Append(", primary opponent ").Append(opponentTeam).Append(" active poles ").Append(CountActivePoles(opponentTeam)).Append(", opponent average stability ").Append(GetTeamAverageStability(opponentTeam).ToString("F0"));
+        builder.Append(", current enemy target tilt ").Append(enemyPole != null ? enemyPole.TiltAngleDegrees.ToString("F1") : "-").Append(". ");
+        if (RequireAllPolesDownToLose)
+        {
+            builder.Append("This venue has three poles per team. A team loses only after all three poles fall. Fallen poles stay down and should be ignored as attack or defense targets. ");
+        }
+        if (RequireLastPoleStanding)
+        {
+            builder.Append("This venue has four teams. Each team has one pole. The battle continues until only one team's pole remains standing; eliminated teams should not be chosen as targets. ");
+        }
+        if (VenueId == "E")
+        {
+            builder.Append("This venue has unequal agent abilities. Use stronger agents for high-force tasks and faster agents for movement-sensitive roles when useful. ");
+        }
+        builder.Append("Force-vector rule: same-side attackers create stronger torque, opposite pushes cancel, defenders should push opposite the own pole lean. ");
+        builder.Append("Teammate discussion so far: ");
+        AppendOpinionSummaries(builder, visibleOpinions, 24);
+        builder.Append("Vote for the agent you think should lead this round. You may vote for yourself or another teammate.");
+        return builder.ToString();
+    }
+
+    private string BuildPhaseInstruction(string phase)
+    {
+        if (phase == "initial")
+        {
+            return "This is Round 1. Give your initial opinion before seeing a full team consensus. State what role you want, what action you prefer, and who you initially trust as leader. ";
+        }
+
+        if (phase == "response")
+        {
+            return "This is Round 2. Read teammate opinions, then agree, disagree, or revise your plan. Mention whose idea influenced you. You may change your leader vote. ";
+        }
+
+        return "This is Round 3. Make your final decision after discussion. Cast your final leader vote and final preferred role/action. ";
+    }
+
+    private string GetPhaseLabel(string phase)
+    {
+        if (phase == "initial")
+        {
+            return "Round 1 initial";
+        }
+
+        if (phase == "response")
+        {
+            return "Round 2 response";
+        }
+
+        return "Round 3 final";
+    }
+
+    private string BuildOpinionLogText(LLMAgentOpinion opinion)
+    {
+        string role = string.IsNullOrEmpty(opinion.preferredRole) ? "-" : opinion.preferredRole;
+        string action = string.IsNullOrEmpty(opinion.preferredAction) ? "-" : opinion.preferredAction;
+        string vote = string.IsNullOrEmpty(opinion.leaderVote) ? "-" : opinion.leaderVote;
+        string message = string.IsNullOrEmpty(opinion.message) ? "(no message)" : opinion.message;
+        return message + " role=" + role + " action=" + action + " vote=" + vote + " confidence=" + opinion.confidence.ToString("F2");
+    }
+
+    private LLMAgentOpinion CreateFallbackOpinion(TeamId team, PoleAgent agent, string phase, List<LLMAgentOpinion> visibleOpinions)
+    {
+        LLMAgentOpinion opinion = new LLMAgentOpinion();
+        opinion.agent = agent.AgentName;
+        opinion.phase = phase;
+
+        int index = ExtractAgentNumber(agent.AgentName) - 1;
+        int lane = Mathf.Abs(index) % 6;
+        if (lane == 0 || lane == 1)
+        {
+            opinion.preferredRole = "Defender";
+            opinion.preferredAction = "GuardOwnPole";
+            opinion.message = "[fallback] I will defend an active own pole while the local LLM is unavailable.";
+        }
+        else if (lane == 2)
+        {
+            opinion.preferredRole = "Supporter";
+            opinion.preferredAction = "SupportNearestAttacker";
+            opinion.message = "[fallback] I will support the nearest attacker and keep pressure coordinated.";
+        }
+        else
+        {
+            opinion.preferredRole = "Attacker";
+            opinion.preferredAction = "MoveToEnemyPole";
+            opinion.message = "[fallback] I will attack the nearest active enemy pole with the main group.";
+        }
+
+        opinion.leaderVote = ChooseFallbackLeaderVote(team, visibleOpinions);
+        opinion.confidence = 0.35f;
+        return opinion;
+    }
+
+    private string ChooseFallbackLeaderVote(TeamId team, List<LLMAgentOpinion> visibleOpinions)
+    {
+        if (visibleOpinions != null && visibleOpinions.Count > 0)
+        {
+            for (int i = visibleOpinions.Count - 1; i >= 0; i--)
+            {
+                if (!string.IsNullOrEmpty(visibleOpinions[i].leaderVote))
+                {
+                    return visibleOpinions[i].leaderVote;
+                }
+            }
+        }
+
+        List<PoleAgent> members = GetMembers(team);
+        return members.Count > 0 ? members[0].AgentName : "";
+    }
+
+    private int ExtractAgentNumber(string agentName)
+    {
+        Match match = Regex.Match(agentName, "(\\d+)$");
+        if (!match.Success)
+        {
+            return 1;
+        }
+
+        int value;
+        return int.TryParse(match.Groups[1].Value, out value) ? value : 1;
+    }
+
+    private LLMAgentOpinion ParseAgentOpinion(string responseText)
+    {
+        string json = ExtractJsonObject(responseText);
+        if (string.IsNullOrEmpty(json))
+        {
+            return null;
+        }
+
+        try
+        {
+            return JsonUtility.FromJson<LLMAgentOpinion>(json);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private bool ApplyIndividualAgentOpinions(TeamId team, List<LLMAgentOpinion> opinions, bool openingPlan)
+    {
+        List<PoleAgent> members = GetMembers(team);
+        int requiredOpinions = openingPlan && RequireLLMOpeningPlan ? Mathf.Min(members.Count, MinimumLLMAgentOpinionsToStart) : 1;
+        if (opinions.Count < requiredOpinions)
+        {
+            LogSystemConversation("Only " + opinions.Count + " " + team + " agents spoke; required " + requiredOpinions + ".");
+            return false;
+        }
+
+        string leader = ChooseLeaderFromOpinions(team, opinions);
+        RecordLeaderChoice(team, leader, "individual LLM agent votes were aggregated.");
+        AddLimitedRow(leaderRows, Time.time.ToString("F1") + " [" + team + "] individual LLM leader: " + leader);
+
+        AgentRole[] roles = new AgentRole[members.Count];
+        AgentAction[] actions = new AgentAction[members.Count];
+        string[] messages = new string[members.Count];
+
+        for (int i = 0; i < members.Count; i++)
+        {
+            PoleAgent agent = members[i];
+            LLMAgentOpinion opinion = FindOpinion(opinions, agent.AgentName);
+            if (opinion == null)
+            {
+                roles[i] = AgentRole.Attacker;
+                actions[i] = AgentAction.MoveToEnemyPole;
+                messages[i] = "I could not speak this round, so I will follow the team attack plan.";
+                continue;
+            }
+
+            roles[i] = ParseRole(opinion.preferredRole, AgentRole.Attacker);
+            actions[i] = ParseAction(opinion.preferredAction, AgentAction.MoveToEnemyPole);
+            messages[i] = string.IsNullOrEmpty(opinion.message) ? "I propose my own role and leader vote." : opinion.message;
+        }
+
+        BalanceIndividualRoles(roles, actions);
+
+        for (int i = 0; i < members.Count; i++)
+        {
+            PoleAgent agent = members[i];
+            LLMAgentOpinion opinion = FindOpinion(opinions, agent.AgentName);
+            string vote = opinion != null && !string.IsNullOrEmpty(opinion.leaderVote) ? opinion.leaderVote : leader;
+            string message = messages[i] + " Vote leader: " + vote + ".";
+            actions[i] = AlignActionWithRole(roles[i], actions[i]);
+            RecordRoleAssignment(agent, roles[i]);
+            agent.ApplyDecision(new AgentDecision(roles[i], actions[i], message));
+            LogConversation(team, agent.AgentName, message);
+            LogRole(agent, leader);
+            LogDiscussionDecision(team, agent, opinion, leader, "", message);
+        }
+
+        return true;
+    }
+
+    private string ChooseLeaderFromOpinions(TeamId team, List<LLMAgentOpinion> opinions)
+    {
+        List<PoleAgent> members = GetMembers(team);
+        string bestLeader = members.Count > 0 ? members[0].AgentName : "";
+        float bestScore = float.MinValue;
+
+        for (int i = 0; i < members.Count; i++)
+        {
+            string candidate = members[i].AgentName;
+            float score = GetLearningState(team).GetLeaderScore(candidate) * 0.25f;
+
+            for (int j = 0; j < opinions.Count; j++)
+            {
+                if (SameAgentName(opinions[j].leaderVote, candidate))
+                {
+                    score += 1f + Mathf.Clamp01(opinions[j].confidence);
+                }
+            }
+
+            if (score > bestScore)
+            {
+                bestScore = score;
+                bestLeader = candidate;
+            }
+        }
+
+        return bestLeader;
+    }
+
+    private LLMAgentOpinion FindOpinion(List<LLMAgentOpinion> opinions, string agentName)
+    {
+        for (int i = 0; i < opinions.Count; i++)
+        {
+            if (SameAgentName(opinions[i].agent, agentName))
+            {
+                return opinions[i];
+            }
+        }
+
+        return null;
+    }
+
+    private bool SameAgentName(string a, string b)
+    {
+        if (string.IsNullOrEmpty(a) || string.IsNullOrEmpty(b))
+        {
+            return false;
+        }
+
+        return a.Trim().ToLowerInvariant() == b.Trim().ToLowerInvariant();
+    }
+
+    private void BalanceIndividualRoles(AgentRole[] roles, AgentAction[] actions)
+    {
+        int attackers = CountRole(roles, AgentRole.Attacker);
+        int defenders = CountRole(roles, AgentRole.Defender);
+        int supporters = CountRole(roles, AgentRole.Supporter);
+        int minimumDefenders = Mathf.Max(1, roles.Length / 6);
+        int minimumSupporters = Mathf.Max(1, roles.Length / 6);
+        int maximumAttackers = Mathf.Max(4, Mathf.CeilToInt(roles.Length * 0.67f));
+
+        for (int i = 0; i < roles.Length && defenders < minimumDefenders; i++)
+        {
+            if (roles[i] != AgentRole.Defender)
+            {
+                if (roles[i] == AgentRole.Attacker)
+                {
+                    attackers--;
+                }
+                else if (roles[i] == AgentRole.Supporter)
+                {
+                    supporters--;
+                }
+
+                roles[i] = AgentRole.Defender;
+                actions[i] = AgentAction.GuardOwnPole;
+                defenders++;
+            }
+        }
+
+        for (int i = 0; i < roles.Length && supporters < minimumSupporters; i++)
+        {
+            if (roles[i] != AgentRole.Supporter && (roles[i] == AgentRole.Attacker || defenders > minimumDefenders))
+            {
+                if (roles[i] == AgentRole.Attacker)
+                {
+                    attackers--;
+                }
+                else if (roles[i] == AgentRole.Defender)
+                {
+                    defenders--;
+                }
+
+                roles[i] = AgentRole.Supporter;
+                actions[i] = AgentAction.SupportNearestAttacker;
+                supporters++;
+            }
+        }
+
+        for (int i = 0; i < roles.Length && attackers > maximumAttackers; i++)
+        {
+            if (roles[i] == AgentRole.Attacker)
+            {
+                roles[i] = defenders <= supporters ? AgentRole.Defender : AgentRole.Supporter;
+                actions[i] = AlignActionWithRole(roles[i], actions[i]);
+                attackers--;
+                if (roles[i] == AgentRole.Defender)
+                {
+                    defenders++;
+                }
+                else
+                {
+                    supporters++;
+                }
+            }
+        }
+    }
+
+    private int CountRole(AgentRole[] roles, AgentRole role)
+    {
+        int count = 0;
+        for (int i = 0; i < roles.Length; i++)
+        {
+            if (roles[i] == role)
+            {
+                count++;
+            }
+        }
+
+        return count;
+    }
+
+    private void LoadApiKey()
+    {
+        if (string.IsNullOrEmpty(OpenAIApiKey))
+        {
+            OpenAIApiKey = System.Environment.GetEnvironmentVariable("OPENAI_API_KEY");
+        }
+
+        if (string.IsNullOrEmpty(OpenAIApiKey))
+        {
+            string keyPath = Path.Combine(Application.dataPath, OpenAIKeyFileName);
+            if (File.Exists(keyPath))
+            {
+                OpenAIApiKey = File.ReadAllText(keyPath).Trim();
+            }
+        }
+    }
+
+    private void LoadRunLimit()
+    {
+        configuredMatchLimit = 0;
+        string runCountPath = Path.Combine(Application.dataPath, RunCountFileName);
+        if (!File.Exists(runCountPath))
+        {
+            File.WriteAllText(runCountPath, "0");
+            return;
+        }
+
+        string text = File.ReadAllText(runCountPath).Trim();
+        int value;
+        if (int.TryParse(text, out value))
+        {
+            configuredMatchLimit = Mathf.Max(0, value);
+        }
+    }
+
+    private string BuildLLMPrompt(TeamId team)
+    {
+        BattlePole ownPole = GetOwnPole(team);
+        BattlePole enemyPole = GetEnemyPole(team);
+        TeamId opponentTeam = GetPrimaryOpponentTeam(team, ownPole != null ? ownPole.transform.position : Vector3.zero);
+        List<PoleAgent> members = GetMembers(team);
+        StringBuilder builder = new StringBuilder();
+        builder.Append("You are the tactical discussion system for team ").Append(team).Append(" in a pole-toppling simulation. ");
+        builder.Append(LeaderDefinition).Append(" ");
+        builder.Append("Choose one leader and assign every agent a role and action. ");
+        builder.Append("There are ").Append(members.Count).Append(" agents per team. Keep roles clear and proportional: about half attackers, one third defenders, and the rest supporters in balanced situations; use more defenders if your pole is threatened, and more attackers if the enemy pole is close to falling. ");
+        builder.Append("Do not assign everyone to attack. Always keep at least one defender and one supporter unless the battle is already finished. ");
+        builder.Append("Role meanings: Attacker pushes the enemy pole from a coordinated side; Defender guards your own pole and applies counter-force opposite the pole lean; Supporter follows attackers and coordinates group pressure. ");
+        builder.Append("Think in force vectors, not only headcount: pushes from opposite sides can cancel, coordinated same-side pushes increase torque, and defenders can reduce tilt by pushing against the lean direction. ");
+        builder.Append("Return only JSON with this exact shape: ");
+        builder.Append("{\"leader\":\"Red-1\",\"decisions\":[{\"agent\":\"Red-1\",\"role\":\"Attacker\",\"action\":\"MoveToEnemyPole\",\"message\":\"I will push from the right.\"}]}. ");
+        builder.Append("Allowed roles: Attacker, Defender, Supporter. ");
+        builder.Append("Allowed actions: MoveToEnemyPole, GuardOwnPole, SupportNearestAttacker, ChaseEnemy, Idle. ");
+        builder.Append("State: own active poles ").Append(CountActivePoles(team)).Append(", own average stability ").Append(GetTeamAverageStability(team).ToString("F0"));
+        builder.Append(", current own target tilt ").Append(ownPole != null ? ownPole.TiltAngleDegrees.ToString("F1") : "-");
+        builder.Append(", primary opponent ").Append(opponentTeam).Append(" active poles ").Append(CountActivePoles(opponentTeam)).Append(", opponent average stability ").Append(GetTeamAverageStability(opponentTeam).ToString("F0"));
+        builder.Append(", current enemy target tilt ").Append(enemyPole != null ? enemyPole.TiltAngleDegrees.ToString("F1") : "-").Append(". ");
+        if (RequireAllPolesDownToLose)
+        {
+            builder.Append("This venue has three poles per team. A team loses only after all three poles fall. Fallen poles stay down and should be ignored as attack or defense targets. ");
+        }
+        if (RequireLastPoleStanding)
+        {
+            builder.Append("This venue has four teams. Each team has one pole. The battle continues until only one team's pole remains standing; eliminated teams should not be chosen as targets. ");
+        }
+        if (VenueId == "E")
+        {
+            builder.Append("This venue has unequal agent abilities. Use stronger agents for high-force tasks and faster agents for movement-sensitive roles when useful. ");
+        }
+        builder.Append("Team memory: ").Append(GetLearningState(team).GetSummary()).Append(". ");
+        builder.Append("Agents: ");
+        for (int i = 0; i < members.Count; i++)
+        {
+            builder.Append(members[i].GetShortState()).Append("; ");
+        }
+
+        builder.Append("Recent conversation: ");
+        AppendRecentRows(builder, conversationRows, 8);
+        return builder.ToString();
+    }
+
+    private bool ApplyLLMPlan(TeamId team, string jsonText)
+    {
+        string json = ExtractJsonObject(jsonText);
+        if (string.IsNullOrEmpty(json))
+        {
+            return false;
+        }
+
+        LLMTeamPlan plan;
+        try
+        {
+            plan = JsonUtility.FromJson<LLMTeamPlan>(json);
+        }
+        catch
+        {
+            return false;
+        }
+
+        if (plan == null || plan.decisions == null || plan.decisions.Length == 0)
+        {
+            return false;
+        }
+
+        string leader = string.IsNullOrEmpty(plan.leader) ? plan.decisions[0].agent : plan.leader;
+        RecordLeaderChoice(team, leader, "LLM selected this agent as the current round plan proposer.");
+        LogConversation(team, leader, "LLM leader proposal accepted.");
+        AddLimitedRow(leaderRows, Time.time.ToString("F1") + " [" + team + "] LLM leader: " + leader);
+
+        int attackerCount = 0;
+        int defenderCount = 0;
+        int supporterCount = 0;
+
+        for (int i = 0; i < plan.decisions.Length; i++)
+        {
+            LLMDecision raw = plan.decisions[i];
+            PoleAgent agent = FindAgentByName(team, raw.agent);
+            if (agent == null)
+            {
+                continue;
+            }
+
+            AgentRole role = ParseRole(raw.role, AgentRole.Attacker);
+            role = KeepMinimumRoleDiversity(role, i, ref attackerCount, ref defenderCount, ref supporterCount);
+            AgentAction action = ParseAction(raw.action, AgentAction.MoveToEnemyPole);
+            action = AlignActionWithRole(role, action);
+            RecordRoleAssignment(agent, role);
+            string message = string.IsNullOrEmpty(raw.message) ? "I will execute my assigned action." : raw.message;
+            agent.ApplyDecision(new AgentDecision(role, action, message));
+            LogConversation(team, agent.AgentName, message);
+            LogRole(agent, leader);
+        }
+
+        return true;
+    }
+
+    private AgentRole KeepMinimumRoleDiversity(AgentRole requestedRole, int decisionIndex, ref int attackers, ref int defenders, ref int supporters)
+    {
+        AgentRole role = requestedRole;
+
+        if (decisionIndex == 0 && role == AgentRole.Attacker)
+        {
+            role = AgentRole.Defender;
+        }
+        else if (decisionIndex == 1 && role == AgentRole.Attacker)
+        {
+            role = AgentRole.Supporter;
+        }
+        else if (role == AgentRole.Attacker && attackers >= 4)
+        {
+            role = defenders <= supporters ? AgentRole.Defender : AgentRole.Supporter;
+        }
+
+        switch (role)
+        {
+            case AgentRole.Defender:
+                defenders++;
+                break;
+            case AgentRole.Supporter:
+                supporters++;
+                break;
+            default:
+                attackers++;
+                break;
+        }
+
+        return role;
+    }
+
+    private AgentAction AlignActionWithRole(AgentRole role, AgentAction action)
+    {
+        if (role == AgentRole.Defender)
+        {
+            return AgentAction.GuardOwnPole;
+        }
+
+        if (role == AgentRole.Supporter && action == AgentAction.MoveToEnemyPole)
+        {
+            return AgentAction.SupportNearestAttacker;
+        }
+
+        return action;
+    }
+
+    private TeamBrain GetRuleBrain(TeamId team)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                return redBrain;
+            case TeamId.Blue:
+                return blueBrain;
+            case TeamId.Green:
+                return greenBrain;
+            case TeamId.Yellow:
+                return yellowBrain;
+            default:
+                return redBrain;
+        }
+    }
+
+    private void MarkCurrentLeader(TeamId team, string leaderName)
+    {
+        List<PoleAgent> members = GetMembers(team);
+        for (int i = 0; i < members.Count; i++)
+        {
+            members[i].SetLeaderVisual(members[i].AgentName == leaderName);
+        }
+    }
+
+    private List<PoleAgent> GetMembers(TeamId team)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                return redAgents;
+            case TeamId.Blue:
+                return blueAgents;
+            case TeamId.Green:
+                return greenAgents;
+            case TeamId.Yellow:
+                return yellowAgents;
+            default:
+                return redAgents;
+        }
+    }
+
+    private string GetRoleCountSummary(TeamId team)
+    {
+        List<PoleAgent> members = GetMembers(team);
+        int attackers = 0;
+        int defenders = 0;
+        int supporters = 0;
+
+        for (int i = 0; i < members.Count; i++)
+        {
+            switch (members[i].Role)
+            {
+                case AgentRole.Attacker:
+                    attackers++;
+                    break;
+                case AgentRole.Defender:
+                    defenders++;
+                    break;
+                case AgentRole.Supporter:
+                    supporters++;
+                    break;
+            }
+        }
+
+        return "A:" + attackers + " D:" + defenders + " S:" + supporters;
+    }
+
+    private AgentRole ParseRole(string value, AgentRole fallback)
+    {
+        AgentRole parsed;
+        return System.Enum.TryParse(value, true, out parsed) ? parsed : fallback;
+    }
+
+    private AgentAction ParseAction(string value, AgentAction fallback)
+    {
+        AgentAction parsed;
+        return System.Enum.TryParse(value, true, out parsed) ? parsed : fallback;
+    }
+
+    private UnityWebRequest CreateLLMRequest(string prompt)
+    {
+        string body;
+        UnityWebRequest request;
+        if (Provider == LLMProvider.OllamaLocal)
+        {
+            body = "{\"model\":\"" + EscapeJson(LocalLLMModel) + "\",\"prompt\":\"" + EscapeJson(prompt) + "\",\"stream\":false,\"format\":\"json\",\"options\":{\"num_predict\":" + MaxLLMOutputTokens + ",\"temperature\":0.7}}";
+            request = new UnityWebRequest(OllamaGenerateUrl, "POST");
+        }
+        else
+        {
+            body = "{\"model\":\"" + EscapeJson(OpenAIModel) + "\",\"input\":\"" + EscapeJson(prompt) + "\",\"max_output_tokens\":" + MaxLLMOutputTokens + "}";
+            request = new UnityWebRequest("https://api.openai.com/v1/responses", "POST");
+            request.SetRequestHeader("Authorization", "Bearer " + OpenAIApiKey);
+        }
+
+        byte[] payload = Encoding.UTF8.GetBytes(body);
+        request.uploadHandler = new UploadHandlerRaw(payload);
+        request.downloadHandler = new DownloadHandlerBuffer();
+        request.timeout = Mathf.CeilToInt(LLMRequestTimeoutSeconds);
+        request.SetRequestHeader("Content-Type", "application/json");
+        return request;
+    }
+
+    private bool IsLLMReady()
+    {
+        if (!UseLLMBrain)
+        {
+            return false;
+        }
+
+        if (Provider == LLMProvider.OllamaLocal)
+        {
+            return !string.IsNullOrEmpty(LocalLLMModel) && !string.IsNullOrEmpty(OllamaGenerateUrl);
+        }
+
+        return !string.IsNullOrEmpty(OpenAIApiKey);
+    }
+
+    private string GetMissingLLMMessage()
+    {
+        if (!UseLLMBrain)
+        {
+            return "LLM required before start: UseLLMBrain is off";
+        }
+
+        if (Provider == LLMProvider.OllamaLocal)
+        {
+            return "Local LLM required: start Ollama and pull " + LocalLLMModel;
+        }
+
+        return "LLM required before start: set Assets/OpenAIKey.txt";
+    }
+
+    private string ExtractLLMResponseText(string responseJson)
+    {
+        if (Provider == LLMProvider.OllamaLocal)
+        {
+            Match response = Regex.Match(responseJson, "\"response\"\\s*:\\s*\"((?:\\\\.|[^\"])*)\"");
+            if (response.Success)
+            {
+                return UnescapeJson(response.Groups[1].Value);
+            }
+        }
+
+        return ExtractResponseText(responseJson);
+    }
+
+    private string ExtractResponseText(string responseJson)
+    {
+        Match outputText = Regex.Match(responseJson, "\"output_text\"\\s*:\\s*\"((?:\\\\.|[^\"])*)\"");
+        if (outputText.Success)
+        {
+            return UnescapeJson(outputText.Groups[1].Value);
+        }
+
+        Match text = Regex.Match(responseJson, "\"text\"\\s*:\\s*\"((?:\\\\.|[^\"])*)\"");
+        if (text.Success)
+        {
+            return UnescapeJson(text.Groups[1].Value);
+        }
+
+        return responseJson;
+    }
+
+    private string ExtractJsonObject(string text)
+    {
+        int start = text.IndexOf('{');
+        int end = text.LastIndexOf('}');
+        if (start < 0 || end <= start)
+        {
+            return "";
+        }
+
+        return text.Substring(start, end - start + 1);
+    }
+
+    private string EscapeJson(string value)
+    {
+        if (string.IsNullOrEmpty(value))
+        {
+            return "";
+        }
+
+        return value.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("\n", "\\n").Replace("\r", "\\r");
+    }
+
+    private string UnescapeJson(string value)
+    {
+        return value.Replace("\\n", "\n").Replace("\\\"", "\"").Replace("\\\\", "\\");
+    }
+
+    private void AddLimitedRow(List<string> rows, string row)
+    {
+        rows.Add(row);
+        while (rows.Count > 36)
+        {
+            rows.RemoveAt(0);
+        }
+    }
+
+    private void AppendRecentRows(StringBuilder builder, List<string> rows, int maxRows)
+    {
+        int start = Mathf.Max(0, rows.Count - maxRows);
+        for (int i = start; i < rows.Count; i++)
+        {
+            builder.Append(rows[i]).Append(" | ");
+        }
+    }
+
+    private void AppendOpinionSummaries(StringBuilder builder, List<LLMAgentOpinion> opinions, int maxOpinions)
+    {
+        if (opinions == null || opinions.Count == 0)
+        {
+            builder.Append("none yet. ");
+            return;
+        }
+
+        int start = Mathf.Max(0, opinions.Count - maxOpinions);
+        for (int i = start; i < opinions.Count; i++)
+        {
+            LLMAgentOpinion opinion = opinions[i];
+            builder.Append("[")
+                .Append(GetPhaseLabel(opinion.phase))
+                .Append("] ")
+                .Append(opinion.agent)
+                .Append(": role=")
+                .Append(string.IsNullOrEmpty(opinion.preferredRole) ? "-" : opinion.preferredRole)
+                .Append(", action=")
+                .Append(string.IsNullOrEmpty(opinion.preferredAction) ? "-" : opinion.preferredAction)
+                .Append(", vote=")
+                .Append(string.IsNullOrEmpty(opinion.leaderVote) ? "-" : opinion.leaderVote)
+                .Append(", message=")
+                .Append(string.IsNullOrEmpty(opinion.message) ? "(none)" : opinion.message)
+                .Append(" | ");
+        }
+    }
+
+    private void LogEvent(string eventName, PoleAgent agent, string leader, string message)
+    {
+        if (logger == null || agent == null)
+        {
+            return;
+        }
+
+        logger.WriteEvent(
+            eventName,
+            agent.Team,
+            agent.AgentName,
+            agent.Role,
+            agent.CurrentAction,
+            leader,
+            message,
+            GetTeamAverageStability(TeamId.Red),
+            GetTeamAverageStability(TeamId.Blue),
+            agent.transform.position);
+    }
+
+    private PoleAgent FindAgentByName(TeamId team, string name)
+    {
+        List<PoleAgent> agents = GetMembers(team);
+        for (int i = 0; i < agents.Count; i++)
+        {
+            if (agents[i].AgentName == name)
+            {
+                return agents[i];
+            }
+        }
+
+        return null;
+    }
+
+    private PoleAgent FindNearest(Vector3 position, List<PoleAgent> agents, PoleAgent exclude)
+    {
+        PoleAgent best = null;
+        float bestDistance = float.MaxValue;
+
+        for (int i = 0; i < agents.Count; i++)
+        {
+            PoleAgent candidate = agents[i];
+            if (candidate == exclude)
+            {
+                continue;
+            }
+
+            float distance = Vector3.Distance(position, candidate.transform.position);
+            if (distance < bestDistance)
+            {
+                best = candidate;
+                bestDistance = distance;
+            }
+        }
+
+        return best;
+    }
+
+    private void AddSeparationFromList(PoleAgent requester, List<PoleAgent> agents, float radius, ref Vector3 push)
+    {
+        for (int i = 0; i < agents.Count; i++)
+        {
+            PoleAgent other = agents[i];
+            if (other == requester)
+            {
+                continue;
+            }
+
+            Vector3 delta = requester.transform.position - other.transform.position;
+            delta.y = 0f;
+            float distance = delta.magnitude;
+            if (distance > 0.01f && distance < radius)
+            {
+                float strength = (radius - distance) / radius;
+                push += delta.normalized * strength * strength * 2.0f;
+            }
+        }
+    }
+
+    private bool IsPositionClearFromList(PoleAgent requester, Vector3 candidatePosition, List<PoleAgent> agents, float minDistance)
+    {
+        for (int i = 0; i < agents.Count; i++)
+        {
+            PoleAgent other = agents[i];
+            if (other == requester)
+            {
+                continue;
+            }
+
+            Vector3 delta = candidatePosition - other.transform.position;
+            delta.y = 0f;
+            if (delta.sqrMagnitude < minDistance * minDistance)
+            {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    private void DecayPressureScores()
+    {
+        List<PoleAgent> keys = new List<PoleAgent>(recentPressure.Keys);
+        for (int i = 0; i < keys.Count; i++)
+        {
+            recentPressure[keys[i]] *= 0.35f;
+        }
+    }
+
+    private void LoadLearningData()
+    {
+        string folder = Path.Combine(Application.persistentDataPath, "PoleBattleLogs");
+        Directory.CreateDirectory(folder);
+        string suffix = VenueId == "A" ? "" : "_" + VenueId;
+        learningSavePath = Path.Combine(folder, "team_learning" + suffix + ".json");
+
+        if (File.Exists(learningSavePath))
+        {
+            try
+            {
+                learningData = JsonUtility.FromJson<LearningSaveData>(File.ReadAllText(learningSavePath));
+            }
+            catch
+            {
+                learningData = new LearningSaveData();
+            }
+        }
+        else
+        {
+            learningData = new LearningSaveData();
+        }
+
+        if (learningData == null)
+        {
+            learningData = new LearningSaveData();
+        }
+    }
+
+    private void SaveLearningData()
+    {
+        if (learningData == null || string.IsNullOrEmpty(learningSavePath))
+        {
+            return;
+        }
+
+        File.WriteAllText(learningSavePath, JsonUtility.ToJson(learningData, true));
+    }
+
+    private void UpdateLearningAfterBattle(TeamId? winner)
+    {
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            bool won = winner.HasValue && winner.Value == teams[i];
+            GetLearningState(teams[i]).RecordMatchResult(won);
+            RecordAgentRoleLearning(teams[i], won);
+        }
+
+        SaveLearningData();
+
+        if (logger != null)
+        {
+            for (int i = 0; i < teams.Length; i++)
+            {
+                logger.WriteLearningLine("[" + teams[i] + "] " + GetLearningState(teams[i]).GetSummary());
+            }
+        }
+    }
+
+    private void RecordAgentRoleLearning(TeamId team, bool won)
+    {
+        TeamLearningState learning = GetLearningState(team);
+        List<PoleAgent> members = GetMembers(team);
+        for (int i = 0; i < members.Count; i++)
+        {
+            learning.RecordAgentRole(members[i].AgentName, members[i].Role, won);
+        }
+    }
+
+    private void WriteSummaryCsvs(TeamId? winner, string result)
+    {
+        if (logger == null)
+        {
+            return;
+        }
+
+        string winnerTextForCsv = winner.HasValue ? winner.Value.ToString() : "Draw";
+        float duration = Mathf.Max(0f, Time.time - battleStartTime);
+        logger.WriteMatchSummary(
+            VenueId,
+            matchNumber,
+            winnerTextForCsv,
+            result,
+            duration,
+            CountActivePoles(TeamId.Red),
+            CountActivePoles(TeamId.Blue),
+            CountActivePoles(TeamId.Green),
+            CountActivePoles(TeamId.Yellow),
+            GetTeamAverageStability(TeamId.Red),
+            GetTeamAverageStability(TeamId.Blue),
+            GetTeamAverageStability(TeamId.Green),
+            GetTeamAverageStability(TeamId.Yellow),
+            GetRoleCountSummary(TeamId.Red),
+            GetRoleCountSummary(TeamId.Blue),
+            GetRoleCountSummary(TeamId.Green),
+            GetRoleCountSummary(TeamId.Yellow),
+            currentRedLeader,
+            currentBlueLeader,
+            currentGreenLeader,
+            currentYellowLeader);
+
+        TeamId[] teams = GetActiveTeams();
+        for (int t = 0; t < teams.Length; t++)
+        {
+            bool won = winner.HasValue && winner.Value == teams[t];
+            List<PoleAgent> members = GetMembers(teams[t]);
+            for (int i = 0; i < members.Count; i++)
+            {
+                PoleAgent agent = members[i];
+                int pushSamples = GetCounter(pushSamplesThisMatch, agent);
+                float estimatedForceSum = GetFloat(estimatedForceSumThisMatch, agent);
+                float avgForce = pushSamples > 0 ? estimatedForceSum / pushSamples : 0f;
+                logger.WriteAgentSummary(
+                    VenueId,
+                    matchNumber,
+                    teams[t],
+                    agent.AgentName,
+                    agent.AbilityNote,
+                    won,
+                    agent.Role,
+                    agent.CurrentAction,
+                    GetCounter(leaderSelectionsThisMatch, agent),
+                    GetCounter(attackerAssignmentsThisMatch, agent),
+                    GetCounter(defenderAssignmentsThisMatch, agent),
+                    GetCounter(supporterAssignmentsThisMatch, agent),
+                    pushSamples,
+                    estimatedForceSum,
+                    avgForce);
+            }
+        }
+    }
+
+    private void FinishBattle(string result, TeamId? winner)
+    {
+        if (BattleFinished)
+        {
+            return;
+        }
+
+        BattleFinished = true;
+        finishedBattleDurationSeconds = Mathf.Max(0f, Time.time - battleStartTime);
+        winnerText = result;
+        UpdateLearningAfterBattle(winner);
+        WriteSummaryCsvs(winner, result);
+
+        TeamId[] teams = GetActiveTeams();
+        for (int t = 0; t < teams.Length; t++)
+        {
+            LogMatchResultToDiscussionCsv(teams[t], result);
+        }
+
+        globalMatchNumber++;
+
+        for (int t = 0; t < teams.Length; t++)
+        {
+            List<PoleAgent> members = GetMembers(teams[t]);
+            for (int i = 0; i < members.Count; i++)
+            {
+                members[i].ApplyDecision(new AgentDecision(members[i].Role, AgentAction.Celebrate, result));
+                LogEvent("finish", members[i], "", result);
+            }
+        }
+
+        if (logger != null)
+        {
+            logger.Flush();
+        }
+
+        Debug.Log(result);
+
+        LoadRunLimit();
+        if (AutoRestartBattles && ShouldRestartAfterThisMatch())
+        {
+            StartCoroutine(RestartBattleAfterDelay());
+        }
+        else if (configuredMatchLimit > 0 && matchNumber >= configuredMatchLimit)
+        {
+            llmStatus = "Run limit reached: " + configuredMatchLimit + " matches complete";
+            LogSystemConversation("Run limit reached. Auto restart stopped after " + configuredMatchLimit + " matches.");
+        }
+    }
+
+    private IEnumerator RestartBattleAfterDelay()
+    {
+        yield return new WaitForSeconds(RestartDelaySeconds);
+        PoleBattleBootstrap.RestartBattle();
+    }
+
+    private bool ShouldRestartAfterThisMatch()
+    {
+        return configuredMatchLimit <= 0 || matchNumber < configuredMatchLimit;
+    }
+
+    private void LogMatchResultToDiscussionCsv(TeamId team, string result)
+    {
+        List<PoleAgent> members = GetMembers(team);
+        string leader = GetCurrentLeader(team);
+        for (int i = 0; i < members.Count; i++)
+        {
+            LogDiscussionDecision(team, members[i], null, leader, result, "Match " + matchNumber + " result: " + result);
+        }
+    }
+
+    private string GetCurrentLeader(TeamId team)
+    {
+        switch (team)
+        {
+            case TeamId.Red:
+                return currentRedLeader;
+            case TeamId.Blue:
+                return currentBlueLeader;
+            case TeamId.Green:
+                return currentGreenLeader;
+            case TeamId.Yellow:
+                return currentYellowLeader;
+            default:
+                return "";
+        }
+    }
+
+    private void OnGUI()
+    {
+        GUI.Box(new Rect(12, 12, 760, 306), "");
+        GUI.Label(new Rect(24, 24, 420, 24), "AI Pole Battle Prototype - Match " + matchNumber);
+        GUI.Label(new Rect(24, 48, 720, 24), "Venue " + VenueId + ": " + VenueName + "   [1] [2] [3] [4] [5]");
+        GUI.Label(new Rect(24, 72, 580, 24), "Red poles: " + GetTeamPoleSummary(TeamId.Red) + " tilt: " + (RedPole != null ? RedPole.TiltAngleDegrees.ToString("F1") : "-"));
+        GUI.Label(new Rect(24, 96, 580, 24), "Blue poles: " + GetTeamPoleSummary(TeamId.Blue) + " tilt: " + (BluePole != null ? BluePole.TiltAngleDegrees.ToString("F1") : "-"));
+        if (RequireLastPoleStanding)
+        {
+            GUI.Label(new Rect(24, 120, 580, 24), "Green poles: " + GetTeamPoleSummary(TeamId.Green) + " tilt: " + GetTeamTiltSummary(TeamId.Green));
+            GUI.Label(new Rect(24, 144, 580, 24), "Yellow poles: " + GetTeamPoleSummary(TeamId.Yellow) + " tilt: " + GetTeamTiltSummary(TeamId.Yellow));
+        }
+
+        int statusY = RequireLastPoleStanding ? 168 : 120;
+        string progressText = !BattleStarted ? "Waiting for opening discussion" : "Discussion in " + Mathf.Max(0f, nextDiscussionTime - Time.time).ToString("F1") + " sec";
+        GUI.Label(new Rect(24, statusY, 350, 24), BattleFinished ? winnerText : progressText);
+        GUI.Label(new Rect(390, statusY, 350, 24), GetBattleTimeSummary());
+        string providerText = Provider == LLMProvider.OpenAI ? "OpenAI " + OpenAIModel : "Ollama " + LocalLLMModel;
+        GUI.Label(new Rect(24, statusY + 24, 700, 24), llmStatus + " (" + providerText + ")");
+        GUI.Label(new Rect(24, statusY + 48, 720, 24), GetRunLimitSummary());
+        GUI.Label(new Rect(24, statusY + 72, 720, 24), "Role counts: " + BuildRoleCountSummary());
+        GUI.Label(new Rect(24, statusY + 96, 720, 24), "Learning: " + BuildLearningSummary());
+
+        if (logger != null)
+        {
+            GUI.Label(new Rect(24, statusY + 120, 720, 24), "CSV: " + ShortPath(logger.LogPath) + " | " + ShortPath(logger.DiscussionPath));
+            GUI.Label(new Rect(24, statusY + 142, 720, 24), "Force/Summary: " + ShortPath(logger.ForcePath) + " | " + ShortPath(logger.MatchSummaryPath) + " | " + ShortPath(logger.AgentSummaryPath));
+        }
+
+        if (VenueId == "E")
+        {
+            GUI.Label(new Rect(24, statusY + 164, 720, 24), BuildAbilitySummary());
+        }
+
+        DrawTable(new Rect(Screen.width - 430, 12, 410, 250), "AI conversation", conversationRows);
+        DrawTable(new Rect(Screen.width - 430, 272, 410, 170), "Force by pole", forceRows);
+        DrawTable(new Rect(Screen.width - 430, 452, 410, 130), "Push log", pushRows);
+        DrawTable(new Rect(Screen.width - 430, 592, 410, 130), "Leaders", leaderRows);
+    }
+
+    private string GetTeamTiltSummary(TeamId team)
+    {
+        BattlePole pole = GetActivePole(team);
+        return pole != null ? pole.TiltAngleDegrees.ToString("F1") : "-";
+    }
+
+    private string BuildRoleCountSummary()
+    {
+        StringBuilder builder = new StringBuilder();
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append(" | ");
+            }
+
+            builder.Append(teams[i]).Append(" ").Append(GetRoleCountSummary(teams[i]));
+        }
+
+        return builder.ToString();
+    }
+
+    private string BuildLearningSummary()
+    {
+        StringBuilder builder = new StringBuilder();
+        TeamId[] teams = GetActiveTeams();
+        for (int i = 0; i < teams.Length; i++)
+        {
+            if (i > 0)
+            {
+                builder.Append(" | ");
+            }
+
+            builder.Append(teams[i]).Append(" ").Append(GetLearningState(teams[i]).GetSummary());
+        }
+
+        return builder.ToString();
+    }
+
+    private string BuildAbilitySummary()
+    {
+        return "Abilities: 1 power x2 | 2 power x0.5 | 3 speed x2 | 4 speed x0.5 | 5-6 normal";
+    }
+
+    private string GetBattleTimeSummary()
+    {
+        if (!BattleStarted)
+        {
+            return "Battle time: waiting";
+        }
+
+        if (BattleFinished)
+        {
+            return "Battle time: " + finishedBattleDurationSeconds.ToString("F1") + " sec";
+        }
+
+        return "Battle time: " + Mathf.Max(0f, Time.time - battleStartTime).ToString("F1") + " sec";
+    }
+
+    private string GetRunLimitSummary()
+    {
+        if (configuredMatchLimit <= 0)
+        {
+            return "Run limit: unlimited (Assets/RunCount.txt = 0)";
+        }
+
+        return "Run limit: " + matchNumber + " / " + configuredMatchLimit + " matches";
+    }
+
+    private string ShortPath(string path)
+    {
+        if (string.IsNullOrEmpty(path))
+        {
+            return "";
+        }
+
+        return Path.GetFileName(path);
+    }
+
+    private void DrawTable(Rect rect, string title, List<string> rows)
+    {
+        GUI.Box(rect, "");
+        GUI.Label(new Rect(rect.x + 10, rect.y + 8, rect.width - 20, 22), title);
+
+        float y = rect.y + 32;
+        int maxVisibleRows = Mathf.Max(1, Mathf.FloorToInt((rect.height - 40f) / 18f));
+        int start = Mathf.Max(0, rows.Count - maxVisibleRows);
+        for (int i = start; i < rows.Count; i++)
+        {
+            GUI.Label(new Rect(rect.x + 10, y, rect.width - 20, 18), rows[i]);
+            y += 18;
+        }
+    }
+}
+
+[System.Serializable]
+public class LLMTeamPlan
+{
+    public string leader;
+    public LLMDecision[] decisions;
+}
+
+[System.Serializable]
+public class LLMDecision
+{
+    public string agent;
+    public string role;
+    public string action;
+    public string message;
+}
+
+[System.Serializable]
+public class LLMAgentOpinion
+{
+    public string agent;
+    public string phase;
+    public string preferredRole;
+    public string preferredAction;
+    public string leaderVote;
+    public string message;
+    public float confidence;
+}

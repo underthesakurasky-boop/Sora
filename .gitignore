@@ -1,0 +1,46 @@
+# Unity generated directories
+[Ll]ibrary/
+[Tt]emp/
+[Oo]bj/
+[Bb]uild/
+[Bb]uilds/
+[Ll]ogs/
+[Uu]ser[Ss]ettings/
+[Mm]emoryCaptures/
+[Rr]ecordings/
+
+# IDE and operating system files
+.git/
+.vs/
+.vscode/
+.idea/
+*.csproj
+*.sln
+*.suo
+*.user
+*.userprefs
+*.pidb
+*.booproj
+*.svd
+*.pdb
+*.mdb
+*.opendb
+*.VC.db
+.DS_Store
+Thumbs.db
+
+# Builds and packages
+*.apk
+*.aab
+*.unitypackage
+
+# Local credentials and experiment controls
+Assets/OpenAIKey*.txt
+Assets/OpenAIKey*.txt.meta
+Assets/OpenAPIKey*.txt
+Assets/OpenAPIKey*.txt.meta
+Assets/RunCount.txt
+Assets/RunCount.txt.meta
+Assets/ResetExperimentData.txt
+Assets/ResetExperimentData.txt.meta
+
